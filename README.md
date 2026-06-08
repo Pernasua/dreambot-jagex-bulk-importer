@@ -37,6 +37,8 @@ Passwords may contain `:`. The parser uses the first and last separators.
 java -jar dist/dreambot-jagex-bulk-importer.jar
 ```
 
+The GUI has start, pause/resume, and stop controls.
+
 ## Notes
 
 - Does not require DreamBot.

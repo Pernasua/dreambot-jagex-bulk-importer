@@ -13,15 +13,23 @@ final class JagexCdpAutomation {
   private final BrowserSession browser;
   private final long humanCheckWaitMs;
   private final Consumer<String> log;
+  private final RunControl control;
 
   JagexCdpAutomation(BrowserSession browser, long humanCheckWaitMs, Consumer<String> log) {
+    this(browser, humanCheckWaitMs, log, RunControl.NONE);
+  }
+
+  JagexCdpAutomation(BrowserSession browser, long humanCheckWaitMs, Consumer<String> log,
+      RunControl control) {
     this.browser = browser;
     this.humanCheckWaitMs = Math.max(0, humanCheckWaitMs);
     this.log = log == null ? ignored -> { } : log;
+    this.control = control == null ? RunControl.NONE : control;
   }
 
   JagexOAuthClient.Callback completeAuth(JagexOAuthClient.AuthRequest request, String email,
       String password, String otpSecret) throws Exception {
+    control.checkpoint();
     browser.prepareAuthRequest(request);
     boolean nativeJcefNavigation = browser.engine == BrowserEngine.JCEF;
     if (nativeJcefNavigation) {
@@ -47,6 +55,7 @@ final class JagexCdpAutomation {
       String lastAction = "";
 
       while (System.currentTimeMillis() < deadline) {
+        control.checkpoint();
         State state = readState(cdp);
         JagexOAuthClient.Callback callback = callback(state, cdp.observedUrls(), request.state);
         if (callback != null) {
@@ -228,6 +237,7 @@ final class JagexCdpAutomation {
     long deadline = System.currentTimeMillis() + humanCheckWaitMs;
     long lastClick = 0L;
     while (System.currentTimeMillis() < deadline) {
+      control.checkpoint();
       State state = readState(cdp);
       if (callback(state, cdp.observedUrls(), expectedState) != null) {
         return true;
@@ -521,12 +531,7 @@ final class JagexCdpAutomation {
   }
 
   private void sleep(long millis) {
-    try {
-      Thread.sleep(millis);
-    } catch (InterruptedException exception) {
-      Thread.currentThread().interrupt();
-      throw new IllegalStateException("interrupted", exception);
-    }
+    control.sleep(millis);
   }
 
   static final class TemporaryOAuthException extends Exception {

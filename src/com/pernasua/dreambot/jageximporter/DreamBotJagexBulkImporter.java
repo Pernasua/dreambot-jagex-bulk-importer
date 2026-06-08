@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.function.Consumer;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
@@ -191,6 +192,7 @@ public final class DreamBotJagexBulkImporter {
     private final Config config;
     private final Consumer<String> log;
     private final Progress progress;
+    private final RunControl control;
     private final DreamBotAccountStore.BackupContext backupContext = DreamBotAccountStore.backupContext();
 
     Importer(Config config, Consumer<String> log) {
@@ -198,9 +200,14 @@ public final class DreamBotJagexBulkImporter {
     }
 
     Importer(Config config, Consumer<String> log, Progress progress) {
+      this(config, log, progress, RunControl.NONE);
+    }
+
+    Importer(Config config, Consumer<String> log, Progress progress, RunControl control) {
       this.config = config;
       this.log = log == null ? ignored -> { } : log;
       this.progress = progress == null ? NO_PROGRESS : progress;
+      this.control = control == null ? RunControl.NONE : control;
     }
 
     int run() throws Exception {
@@ -233,12 +240,15 @@ public final class DreamBotJagexBulkImporter {
       int total = end - config.start + 1;
       progress.total(total);
       for (int rowIndex = config.start; rowIndex <= end; rowIndex++) {
+        control.checkpoint();
         AccountRow account = rows.get(rowIndex - 1).withIndex(rowIndex);
         int completedBefore = rowIndex - config.start;
         progress.row(completedBefore, total, "Starting row " + account.index + " " + account.email);
         try {
           String status = importOne(oauth, account);
           progress.row(completedBefore + 1, total, "Row " + account.index + " " + status);
+        } catch (CancellationException exception) {
+          throw exception;
         } catch (Exception exception) {
           failures++;
           String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
@@ -251,6 +261,7 @@ public final class DreamBotJagexBulkImporter {
     }
 
     private String importOne(JagexOAuthClient oauth, AccountRow account) throws Exception {
+      control.checkpoint();
       account.validate();
       log.accept("row " + account.index + " " + account.email + " start");
       log.accept("row " + account.index + " input validated; OTP secret accepted");
@@ -264,11 +275,12 @@ public final class DreamBotJagexBulkImporter {
       }
 
       for (int attempt = 1; attempt <= MAX_TEMPORARY_OAUTH_ATTEMPTS; attempt++) {
+        control.checkpoint();
         try (BrowserSession browser = launchBrowser(config.browserEngine, config.browserPath, config.jcefDir,
             config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(),
               message -> log.accept("row " + account.index + " " + message))) {
           JagexCdpAutomation automation = new JagexCdpAutomation(browser, config.humanCheckWaitMs,
-              message -> log.accept("row " + account.index + " " + message));
+              message -> log.accept("row " + account.index + " " + message), control);
 
           log.accept("row " + account.index + " launcher OAuth attempt " + attempt
               + "/" + MAX_TEMPORARY_OAUTH_ATTEMPTS + " starting");
@@ -285,6 +297,7 @@ public final class DreamBotJagexBulkImporter {
           log.accept("row " + account.index + " launcher OAuth exchange complete; provider " + provider
               + ", token expiry " + Instant.ofEpochSecond(tokens.expiresAt));
           if ("runescape".equals(provider)) {
+            control.checkpoint();
             log.accept("row " + account.index + " fetching legacy RuneScape profile");
             JagexOAuthClient.RunescapeProfile profile = oauth.fetchRunescapeProfile(tokens.idToken);
             DreamBotAccountStore.AddResult result =
@@ -302,6 +315,7 @@ public final class DreamBotJagexBulkImporter {
             return "added_legacy";
           }
 
+          control.checkpoint();
           log.accept("row " + account.index + " starting Jagex account consent OAuth");
           JagexOAuthClient.AuthRequest consentRequest = oauth.consentAuthRequest(tokens);
           JagexOAuthClient.Callback consentCallback =
@@ -311,6 +325,7 @@ public final class DreamBotJagexBulkImporter {
           }
           log.accept("row " + account.index + " consent OAuth callback received; fetching game session");
 
+          control.checkpoint();
           JagexOAuthClient.GameSession session = oauth.fetchGameSession(consentCallback.idToken);
           log.accept("row " + account.index + " game session fetched; " + session.accounts.size()
               + " character account(s)");
@@ -349,12 +364,7 @@ public final class DreamBotJagexBulkImporter {
     }
 
     private void sleepBeforeRetry(int attempt) {
-      try {
-        Thread.sleep(Math.min(15_000L, 4_000L * attempt));
-      } catch (InterruptedException exception) {
-        Thread.currentThread().interrupt();
-        throw new IllegalStateException("interrupted", exception);
-      }
+      control.sleep(Math.min(15_000L, 4_000L * attempt));
     }
 
     private List<AccountRow> readRowsFromStdin() throws IOException {
@@ -563,6 +573,11 @@ public final class DreamBotJagexBulkImporter {
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
+    private final JButton start = new JButton("Start");
+    private final JButton pause = new JButton("Pause");
+    private final JButton stop = new JButton("Stop");
+    private SwingWorker<Integer, String> worker;
+    private GuiRunControl runControl;
 
     void show() {
       JFrame frame = new JFrame("DreamBot Jagex Bulk Importer");
@@ -577,12 +592,17 @@ public final class DreamBotJagexBulkImporter {
       updateEngineFields();
 
       JPanel buttons = new JPanel();
-      JButton start = new JButton("Start");
-      start.addActionListener(event -> start(start));
+      start.addActionListener(event -> start());
+      pause.addActionListener(event -> togglePause());
+      stop.addActionListener(event -> stop());
+      pause.setEnabled(false);
+      stop.setEnabled(false);
       buttons.add(dryRun);
       buttons.add(headless);
       buttons.add(keepBrowserOpen);
       buttons.add(start);
+      buttons.add(pause);
+      buttons.add(stop);
 
       log.setEditable(false);
       progress.setStringPainted(true);
@@ -648,7 +668,10 @@ public final class DreamBotJagexBulkImporter {
       headless.setText(embedded ? "Minimized/internal browser" : "Headless system browser");
     }
 
-    private void start(JButton button) {
+    private void start() {
+      if (worker != null && !worker.isDone()) {
+        return;
+      }
       Config config = new Config();
       config.input = input.getText().trim().isEmpty() ? null : Paths.get(input.getText().trim());
       config.db = db.getText().trim().isEmpty() ? null : Paths.get(db.getText().trim());
@@ -657,13 +680,19 @@ public final class DreamBotJagexBulkImporter {
       config.headless = headless.isSelected();
       config.keepBrowserOpen = keepBrowserOpen.isSelected();
 
-      button.setEnabled(false);
+      GuiRunControl control = new GuiRunControl();
+      runControl = control;
+      start.setEnabled(false);
+      pause.setEnabled(true);
+      pause.setText("Pause");
+      stop.setEnabled(true);
       log.setText("");
+      log.setCaretPosition(0);
       progress.setIndeterminate(true);
       progress.setValue(0);
       progress.setString("Starting");
       status.setText("Starting");
-      SwingWorker<Integer, String> worker = new SwingWorker<>() {
+      worker = new SwingWorker<>() {
         @Override
         protected Integer doInBackground() throws Exception {
           Progress progressReporter = new Progress() {
@@ -689,35 +718,117 @@ public final class DreamBotJagexBulkImporter {
               });
             }
           };
-          return new Importer(config, this::publish, progressReporter).run();
+          return new Importer(config, this::publish, progressReporter, control).run();
         }
 
         @Override
         protected void process(List<String> chunks) {
           for (String chunk : chunks) {
-            log.append(chunk + "\n");
+            appendLog(chunk);
           }
         }
 
         @Override
         protected void done() {
-          button.setEnabled(true);
+          start.setEnabled(true);
+          pause.setEnabled(false);
+          pause.setText("Pause");
+          stop.setEnabled(false);
+          runControl = null;
           try {
+            if (isCancelled() || control.isStopped()) {
+              appendLog("Stopped");
+              status.setText("Stopped");
+              progress.setIndeterminate(false);
+              return;
+            }
             int exitCode = get();
-            log.append("Finished with exit code " + exitCode + "\n");
+            appendLog("Finished with exit code " + exitCode);
             status.setText(exitCode == 0 ? "Finished successfully" : "Finished with failures");
             if (!progress.isIndeterminate() && progress.getMaximum() > 0) {
               progress.setValue(progress.getMaximum());
               progress.setString(progress.getValue() + " / " + progress.getMaximum());
             }
+          } catch (CancellationException exception) {
+            appendLog("Stopped");
+            status.setText("Stopped");
+            progress.setIndeterminate(false);
           } catch (Exception exception) {
-            log.append("Failed: " + exception.getMessage() + "\n");
+            appendLog("Failed: " + exception.getMessage());
             status.setText("Failed: " + exception.getMessage());
             progress.setIndeterminate(false);
           }
         }
       };
       worker.execute();
+    }
+
+    private void togglePause() {
+      GuiRunControl control = runControl;
+      if (control == null) {
+        return;
+      }
+      boolean paused = control.togglePaused();
+      pause.setText(paused ? "Resume" : "Pause");
+      status.setText(paused ? "Paused" : "Running");
+      appendLog(paused ? "Paused" : "Resumed");
+    }
+
+    private void stop() {
+      GuiRunControl control = runControl;
+      if (control != null) {
+        control.stop();
+      }
+      if (worker != null) {
+        worker.cancel(true);
+      }
+      pause.setEnabled(false);
+      stop.setEnabled(false);
+      status.setText("Stopping");
+      appendLog("Stop requested");
+    }
+
+    private void appendLog(String line) {
+      log.append(line + "\n");
+      log.setCaretPosition(log.getDocument().getLength());
+    }
+  }
+
+  private static final class GuiRunControl implements RunControl {
+    private boolean paused;
+    private boolean stopped;
+
+    synchronized boolean togglePaused() {
+      paused = !paused;
+      notifyAll();
+      return paused;
+    }
+
+    synchronized boolean isStopped() {
+      return stopped;
+    }
+
+    synchronized void stop() {
+      stopped = true;
+      paused = false;
+      notifyAll();
+    }
+
+    @Override
+    public void checkpoint() {
+      synchronized (this) {
+        while (paused && !stopped) {
+          try {
+            wait(250L);
+          } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new CancellationException("interrupted");
+          }
+        }
+        if (stopped) {
+          throw new CancellationException("stopped");
+        }
+      }
     }
   }
 
