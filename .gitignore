@@ -1,0 +1,10 @@
+build/
+dist/
+*.class
+*.log
+*.db
+*.db.bak*
+*.jsonl
+*.tmp
+*.swp
+.DS_Store

@@ -1,0 +1,80 @@
+package com.pernasua.dreambot.jageximporter;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+final class BrowserSession implements AutoCloseable {
+  final BrowserEngine engine;
+  final String endpoint;
+  final int port;
+  final boolean headless;
+  final boolean keepOpen;
+
+  private final AutoCloseable closeAction;
+  private final Runnable revealAction;
+  private final Runnable hideAction;
+  private final Consumer<JagexOAuthClient.AuthRequest> authRequestAction;
+  private final Consumer<String> navigateAction;
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+
+  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
+      boolean keepOpen, AutoCloseable closeAction) {
+    this(engine, endpoint, port, headless, keepOpen, closeAction, null, null, null);
+  }
+
+  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
+      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction) {
+    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, null, null);
+  }
+
+  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
+      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
+      Consumer<JagexOAuthClient.AuthRequest> authRequestAction) {
+    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction, authRequestAction, null);
+  }
+
+  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
+      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
+      Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction) {
+    this.engine = engine;
+    this.endpoint = endpoint;
+    this.port = port;
+    this.headless = headless;
+    this.keepOpen = keepOpen;
+    this.closeAction = closeAction == null ? () -> { } : closeAction;
+    this.revealAction = revealAction == null ? () -> { } : revealAction;
+    this.hideAction = hideAction == null ? () -> { } : hideAction;
+    this.authRequestAction = authRequestAction == null ? ignored -> { } : authRequestAction;
+    this.navigateAction = navigateAction == null ? ignored -> { } : navigateAction;
+  }
+
+  void reveal() {
+    revealAction.run();
+  }
+
+  void hide() {
+    hideAction.run();
+  }
+
+  void prepareAuthRequest(JagexOAuthClient.AuthRequest request) {
+    authRequestAction.accept(request);
+  }
+
+  void navigate(String url) {
+    navigateAction.accept(url);
+  }
+
+  @Override
+  public void close() {
+    if (!closed.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      closeAction.close();
+    } catch (RuntimeException exception) {
+      throw exception;
+    } catch (Exception exception) {
+      throw new IllegalStateException("could not close browser session", exception);
+    }
+  }
+}
