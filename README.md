@@ -38,6 +38,7 @@ java -jar dist/dreambot-jagex-bulk-importer.jar
 ```
 
 The GUI has start, pause/resume, and stop controls.
+When a run finishes, the GUI opens the ledger file.
 
 ## Notes
 

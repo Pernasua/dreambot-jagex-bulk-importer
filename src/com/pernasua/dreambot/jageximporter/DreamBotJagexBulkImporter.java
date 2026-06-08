@@ -1,6 +1,7 @@
 package com.pernasua.dreambot.jageximporter;
 
 import java.awt.BorderLayout;
+import java.awt.Desktop;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
@@ -567,7 +568,6 @@ public final class DreamBotJagexBulkImporter {
     private final JTextField input = new JTextField();
     private final JTextField db = new JTextField();
     private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
-    private final JCheckBox dryRun = new JCheckBox("Dry run");
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JCheckBox keepBrowserOpen = new JCheckBox("Keep browser open");
     private final JProgressBar progress = new JProgressBar();
@@ -597,7 +597,6 @@ public final class DreamBotJagexBulkImporter {
       stop.addActionListener(event -> stop());
       pause.setEnabled(false);
       stop.setEnabled(false);
-      buttons.add(dryRun);
       buttons.add(headless);
       buttons.add(keepBrowserOpen);
       buttons.add(start);
@@ -676,7 +675,6 @@ public final class DreamBotJagexBulkImporter {
       config.input = input.getText().trim().isEmpty() ? null : Paths.get(input.getText().trim());
       config.db = db.getText().trim().isEmpty() ? null : Paths.get(db.getText().trim());
       config.browserEngine = engine.getSelectedIndex() == 0 ? BrowserEngine.JCEF : BrowserEngine.SYSTEM;
-      config.dryRun = dryRun.isSelected();
       config.headless = headless.isSelected();
       config.keepBrowserOpen = keepBrowserOpen.isSelected();
 
@@ -735,6 +733,7 @@ public final class DreamBotJagexBulkImporter {
           pause.setText("Pause");
           stop.setEnabled(false);
           runControl = null;
+          boolean openLedger = false;
           try {
             if (isCancelled() || control.isStopped()) {
               appendLog("Stopped");
@@ -745,6 +744,7 @@ public final class DreamBotJagexBulkImporter {
             int exitCode = get();
             appendLog("Finished with exit code " + exitCode);
             status.setText(exitCode == 0 ? "Finished successfully" : "Finished with failures");
+            openLedger = true;
             if (!progress.isIndeterminate() && progress.getMaximum() > 0) {
               progress.setValue(progress.getMaximum());
               progress.setString(progress.getValue() + " / " + progress.getMaximum());
@@ -757,6 +757,11 @@ public final class DreamBotJagexBulkImporter {
             appendLog("Failed: " + exception.getMessage());
             status.setText("Failed: " + exception.getMessage());
             progress.setIndeterminate(false);
+            openLedger = true;
+          } finally {
+            if (openLedger) {
+              openLedger(config.ledger);
+            }
           }
         }
       };
@@ -791,6 +796,26 @@ public final class DreamBotJagexBulkImporter {
     private void appendLog(String line) {
       log.append(line + "\n");
       log.setCaretPosition(log.getDocument().getLength());
+    }
+
+    private void openLedger(Path ledger) {
+      if (ledger == null || !Files.isRegularFile(ledger)) {
+        appendLog("Ledger file was not created");
+        return;
+      }
+      try {
+        if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")) {
+          new ProcessBuilder("notepad.exe", ledger.toAbsolutePath().toString()).start();
+        } else if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+          Desktop.getDesktop().open(ledger.toFile());
+        } else {
+          appendLog("Ledger: " + ledger.toAbsolutePath());
+          return;
+        }
+        appendLog("Opened ledger: " + ledger.toAbsolutePath());
+      } catch (IOException exception) {
+        appendLog("Could not open ledger: " + exception.getMessage());
+      }
     }
   }
 
