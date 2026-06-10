@@ -178,6 +178,7 @@ public final class DreamBotJagexBulkImporter {
         "  --devtools-port N         Browser DevTools port (default: auto)",
         "  --human-check-wait-ms N   Max wait for browser challenge pages (default: 300000)",
         "  --keep-browser-open       Leave browser open after import attempts",
+        "  --debug-secrets           Log TOTP secrets and generated codes for debugging",
         "  --dry-run                 Parse rows, validate TOTP, and decrypt DB without importing",
         "  --totp SECRET             Utility mode: print the current generated TOTP code"));
   }
@@ -283,8 +284,16 @@ public final class DreamBotJagexBulkImporter {
       if (config.dryRun) {
         Totp.Code code = Totp.generate(account.otpSecret);
         record(account, "dry_run_ok", "validated row, generated TOTP, and decrypted DB", 0, null);
-        log.accept("row " + account.index + " generated TOTP code; value hidden, period "
-            + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter);
+        if (config.debugSecrets) {
+          String normalizedSecret = Totp.normalizeSecret(account.otpSecret);
+          log.accept("row " + account.index + " generated TOTP code " + code.value + "; period "
+              + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter
+              + ", secret " + normalizedSecret
+              + ", secret_sha256 " + sha256(normalizedSecret));
+        } else {
+          log.accept("row " + account.index + " generated TOTP code; value hidden, period "
+              + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter);
+        }
         log.accept("row " + account.index + " dry-run ok");
         return "dry_run_ok";
       }
@@ -295,7 +304,7 @@ public final class DreamBotJagexBulkImporter {
             config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(),
               message -> log.accept("row " + account.index + " " + message))) {
           JagexCdpAutomation automation = new JagexCdpAutomation(browser, config.humanCheckWaitMs,
-              message -> log.accept("row " + account.index + " " + message), control);
+              message -> log.accept("row " + account.index + " " + message), control, config.debugSecrets);
 
           log.accept("row " + account.index + " launcher OAuth attempt " + attempt
               + "/" + MAX_TEMPORARY_OAUTH_ATTEMPTS + " starting");
@@ -497,6 +506,7 @@ public final class DreamBotJagexBulkImporter {
     int devtoolsPort = 0;
     long humanCheckWaitMs = DEFAULT_HUMAN_CHECK_WAIT_MS;
     boolean keepBrowserOpen;
+    boolean debugSecrets;
     boolean dryRun;
     Boolean headless;
 
@@ -558,6 +568,9 @@ public final class DreamBotJagexBulkImporter {
           case "--keep-browser-open":
             config.keepBrowserOpen = true;
             break;
+          case "--debug-secrets":
+            config.debugSecrets = true;
+            break;
           case "--headless":
             config.headless = true;
             break;
@@ -584,6 +597,7 @@ public final class DreamBotJagexBulkImporter {
     private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JCheckBox keepBrowserOpen = new JCheckBox("Keep browser open");
+    private final JCheckBox debugSecrets = new JCheckBox("Debug OTP values");
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
@@ -613,6 +627,7 @@ public final class DreamBotJagexBulkImporter {
       stop.setEnabled(false);
       buttons.add(headless);
       buttons.add(keepBrowserOpen);
+      buttons.add(debugSecrets);
       buttons.add(start);
       buttons.add(pause);
       buttons.add(stop);
@@ -691,6 +706,7 @@ public final class DreamBotJagexBulkImporter {
       config.browserEngine = engine.getSelectedIndex() == 0 ? BrowserEngine.JCEF : BrowserEngine.SYSTEM;
       config.headless = headless.isSelected();
       config.keepBrowserOpen = keepBrowserOpen.isSelected();
+      config.debugSecrets = debugSecrets.isSelected();
 
       GuiRunControl control = new GuiRunControl();
       runControl = control;

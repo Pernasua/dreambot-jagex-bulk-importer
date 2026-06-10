@@ -1,5 +1,7 @@
 package com.pernasua.dreambot.jageximporter;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -14,6 +16,7 @@ final class JagexCdpAutomation {
   private final long humanCheckWaitMs;
   private final Consumer<String> log;
   private final RunControl control;
+  private final boolean debugSecrets;
 
   JagexCdpAutomation(BrowserSession browser, long humanCheckWaitMs, Consumer<String> log) {
     this(browser, humanCheckWaitMs, log, RunControl.NONE);
@@ -21,10 +24,16 @@ final class JagexCdpAutomation {
 
   JagexCdpAutomation(BrowserSession browser, long humanCheckWaitMs, Consumer<String> log,
       RunControl control) {
+    this(browser, humanCheckWaitMs, log, control, false);
+  }
+
+  JagexCdpAutomation(BrowserSession browser, long humanCheckWaitMs, Consumer<String> log,
+      RunControl control, boolean debugSecrets) {
     this.browser = browser;
     this.humanCheckWaitMs = Math.max(0, humanCheckWaitMs);
     this.log = log == null ? ignored -> { } : log;
     this.control = control == null ? RunControl.NONE : control;
+    this.debugSecrets = debugSecrets;
   }
 
   JagexOAuthClient.Callback completeAuth(JagexOAuthClient.AuthRequest request, String email,
@@ -339,9 +348,31 @@ final class JagexCdpAutomation {
       sleep((code.remainingSeconds + 2L) * 1000L);
       code = Totp.generate(secret);
     }
-    log.accept("generated TOTP code; value hidden, period " + code.period + "s, "
-        + code.remainingSeconds + "s remaining, counter " + code.counter);
+    if (debugSecrets) {
+      String normalizedSecret = Totp.normalizeSecret(secret);
+      log.accept("generated TOTP code " + code.value + "; period " + code.period + "s, "
+          + code.remainingSeconds + "s remaining, counter " + code.counter
+          + ", secret " + normalizedSecret
+          + ", secret_sha256 " + sha256(normalizedSecret));
+    } else {
+      log.accept("generated TOTP code; value hidden, period " + code.period + "s, "
+          + code.remainingSeconds + "s remaining, counter " + code.counter);
+    }
     return code;
+  }
+
+  private static String sha256(String value) {
+    try {
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      byte[] bytes = digest.digest(value.getBytes(StandardCharsets.UTF_8));
+      StringBuilder out = new StringBuilder(bytes.length * 2);
+      for (byte b : bytes) {
+        out.append(String.format("%02x", b & 0xFF));
+      }
+      return out.toString();
+    } catch (Exception exception) {
+      throw new IllegalStateException("could not hash TOTP secret", exception);
+    }
   }
 
   private void fillFirst(CdpClient cdp, List<String> selectors, String value) {
@@ -469,20 +500,38 @@ final class JagexCdpAutomation {
   private void fillCodeAndSubmit(CdpClient cdp, String code) {
     Map<String, Object> result = Json.asObject(cdp.evaluate("(() => {"
         + visibleHelpers()
+        + "const typeOk=(input)=>{const type=String(input.type||'text').toLowerCase();"
+        + "return !['hidden','checkbox','radio','submit','button','file','reset'].includes(type);};"
+        + "const meta=(input)=>[input.type,input.name,input.id,input.autocomplete,input.placeholder,input.inputMode,input.maxLength>0?'max='+input.maxLength:''].join(' ');"
+        + "const codeish=(input)=>/code|otp|totp|auth|security|verification|one-time|numeric|digit/i.test(meta(input));"
+        + "const descriptor=(input)=>normalize(meta(input)).slice(0,140);"
         + "const inputs=Array.from(document.querySelectorAll('input')).filter(visible)"
-        + ".filter((input)=>!/email|password/i.test([input.type,input.name,input.id,input.autocomplete,input.placeholder].join(' ')));"
+        + ".filter((input)=>typeOk(input)&&!/email|password/i.test(meta(input)));"
         + "const button=Array.from(document.querySelectorAll('button,input[type=\"submit\"],[role=\"button\"]')).filter(visible)"
         + ".find((el)=>/continue|verify|submit|log in|confirm/i.test(el.innerText||el.value||el.textContent));"
         + "if(inputs.length===0)return null;"
         + "const code=" + Json.quote(code) + ";"
-        + "if(inputs.length>=code.length){for(let i=0;i<code.length;i++){setValue(inputs[i],code[i]);}}"
-        + "else{setValue(inputs[0],code);}"
-        + "const target=button||inputs[inputs.length-1];"
+        + "const digitInputs=inputs.filter((input)=>Number(input.maxLength)===1||codeish(input));"
+        + "let used=[];let mode='single';"
+        + "if(digitInputs.length>=code.length&&inputs.length>1){used=digitInputs.slice(0,code.length);mode='multi-codeish';}"
+        + "else if(inputs.length>=code.length&&inputs.length>1){used=inputs.slice(0,code.length);mode='multi-text';}"
+        + "else{used=[inputs.find(codeish)||inputs[0]];}"
+        + "if(used.length>=code.length){for(let i=0;i<code.length;i++){setValue(used[i],code[i]);}}"
+        + "else{setValue(used[0],code);}"
+        + "const target=button||used[used.length-1];"
         + "target.scrollIntoView({block:'center',inline:'center'});"
-        + "const r=target.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,hasButton:Boolean(button)};"
+        + "const r=target.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,hasButton:Boolean(button),"
+        + "mode,inputCount:inputs.length,usedInputCount:used.length,inputs:inputs.map(descriptor).slice(0,10)};"
         + "})()"));
     if (result.isEmpty()) {
       throw new IllegalStateException("could not find Jagex authenticator-code input");
+    }
+    if (debugSecrets) {
+      log.accept("filled TOTP fields; mode " + Json.string(result.get("mode"))
+          + ", input_count " + Json.string(result.get("inputCount"))
+          + ", used_input_count " + Json.string(result.get("usedInputCount"))
+          + ", has_button " + Json.string(result.get("hasButton"))
+          + ", inputs " + Json.stringify(result.get("inputs")));
     }
     double x = Json.number(result.get("x")).doubleValue();
     double y = Json.number(result.get("y")).doubleValue();
