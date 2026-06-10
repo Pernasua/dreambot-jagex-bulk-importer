@@ -71,6 +71,21 @@ final class JagexCdpAutomation {
         if (state.href.contains("error=") || matches(text, "invalid_request|oauth.*error|redirect_uri")) {
           throw new IllegalStateException("Jagex OAuth error page: " + brief(state.text));
         }
+        if (isCookieNotice(text)) {
+          String clicked = clickText(cdp, Arrays.asList(
+              "use necessary cookies only",
+              "allow all cookies",
+              "accept all",
+              "accept",
+              "confirm choices",
+              "save choices",
+              "reject all"));
+          if (!clicked.isEmpty()) {
+            lastAction = "dismissed cookie notice";
+            sleep(600);
+            continue;
+          }
+        }
         if (matches(text, "technical difficulties|try again later|temporarily unavailable|service unavailable")) {
           throw new TemporaryOAuthException("Jagex temporary OAuth page: " + brief(state.text));
         }
@@ -84,7 +99,7 @@ final class JagexCdpAutomation {
           throw new TerminalAuthException("invalid_otp_code", "Jagex rejected the authenticator code");
         }
 
-        if (matches(text, "cookiebot|this website uses cookies|use necessary cookies only|allow all cookies")) {
+        if (isCookieNotice(text)) {
           String clicked = clickText(cdp, Arrays.asList("use necessary cookies only", "allow all cookies"));
           if (!clicked.isEmpty()) {
             lastAction = "dismissed cookie notice";
@@ -525,6 +540,12 @@ final class JagexCdpAutomation {
 
   private boolean isAccountLocked(String text) {
     return matches(text, "account is locked|locked your account|account locked");
+  }
+
+  private boolean isCookieNotice(String text) {
+    return matches(text,
+        "cookiebot|this website uses cookies|about this website uses cookies|consent details|manage cookies"
+            + "|use necessary cookies only|allow all cookies|cookies to personalise");
   }
 
   private boolean isInvalidCredentials(String text) {
