@@ -52,6 +52,8 @@ When a run finishes, the GUI opens the ledger file.
 - `--system-browser` can use installed Chrome, Chromium, or Edge instead.
 - The ledger is a JSONL audit file for row results. DreamBot does not read it.
 - The ledger includes full emails, but not passwords, TOTP secrets, OTP values, or OAuth tokens.
+- Wrong passwords and rejected authenticator codes are skipped with explicit ledger
+  statuses: `invalid_credentials`, `invalid_otp_code`, or `account_locked`.
 
 ## Useful Commands
 

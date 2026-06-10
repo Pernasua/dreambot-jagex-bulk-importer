@@ -74,11 +74,14 @@ final class JagexCdpAutomation {
         if (matches(text, "technical difficulties|try again later|temporarily unavailable|service unavailable")) {
           throw new TemporaryOAuthException("Jagex temporary OAuth page: " + brief(state.text));
         }
-        if (matches(text, "account is locked|locked your account|account locked")) {
-          throw new IllegalStateException("Jagex reported the account is locked");
+        if (isAccountLocked(text)) {
+          throw new TerminalAuthException("account_locked", "Jagex reported the account is locked");
         }
-        if (matches(text, "incorrect password|invalid login|unable to log you in|problem occurred when trying to log you in")) {
-          throw new IllegalStateException("Jagex login failed");
+        if (isInvalidCredentials(text)) {
+          throw new TerminalAuthException("invalid_credentials", "Jagex rejected the email or password");
+        }
+        if (codeFilled && isRejectedVerificationCode(text)) {
+          throw new TerminalAuthException("invalid_otp_code", "Jagex rejected the authenticator code");
         }
 
         if (matches(text, "cookiebot|this website uses cookies|use necessary cookies only|allow all cookies")) {
@@ -520,6 +523,28 @@ final class JagexCdpAutomation {
     return Pattern.compile(regex, Pattern.CASE_INSENSITIVE).matcher(text == null ? "" : text).find();
   }
 
+  private boolean isAccountLocked(String text) {
+    return matches(text, "account is locked|locked your account|account locked");
+  }
+
+  private boolean isInvalidCredentials(String text) {
+    return matches(text,
+        "email address or password.{0,140}incorrect"
+            + "|incorrect.{0,80}(email address|password|credentials)"
+            + "|invalid credentials"
+            + "|invalid login"
+            + "|unable to log you in"
+            + "|problem occurred when trying to log you in"
+            + "|trying to log into a runescape account.{0,160}upgrad");
+  }
+
+  private boolean isRejectedVerificationCode(String text) {
+    return matches(text,
+        "(incorrect|invalid|expired|wrong).{0,100}(verification|authenticator|security|two[- ]?factor|totp)?\\s*code"
+            + "|code.{0,100}(incorrect|invalid|expired|wrong)"
+            + "|authenticator.{0,100}(incorrect|invalid|expired|wrong)");
+  }
+
   private boolean looksLikeOAuthCallback(String url) {
     String text = String.valueOf(url == null ? "" : url).toLowerCase(Locale.ROOT);
     return text.contains("code=") || text.contains("id_token=");
@@ -537,6 +562,19 @@ final class JagexCdpAutomation {
   static final class TemporaryOAuthException extends Exception {
     TemporaryOAuthException(String message) {
       super(message);
+    }
+  }
+
+  static final class TerminalAuthException extends Exception {
+    private final String status;
+
+    TerminalAuthException(String status, String message) {
+      super(message);
+      this.status = status;
+    }
+
+    String status() {
+      return status;
     }
   }
 

@@ -74,7 +74,7 @@ public final class DreamBotJagexBulkImporter {
       if (argv.size() < 2) {
         throw new IllegalArgumentException("--totp requires a base32 secret");
       }
-      Totp.Code code = Totp.generate(argv.get(1));
+      Totp.Code code = generateFreshTotp(argv.get(1));
       LinkedHashMap<String, Object> out = new LinkedHashMap<>();
       out.put("code", code.value);
       out.put("remaining_seconds", code.remainingSeconds);
@@ -138,6 +138,15 @@ public final class DreamBotJagexBulkImporter {
     }
     Config config = Config.parse(argv);
     return new Importer(config, System.out::println).run();
+  }
+
+  private static Totp.Code generateFreshTotp(String secret) throws InterruptedException {
+    Totp.Code code = Totp.generate(secret);
+    if (code.remainingSeconds < 8) {
+      Thread.sleep((code.remainingSeconds + 2L) * 1000L);
+      code = Totp.generate(secret);
+    }
+    return code;
   }
 
   private static void printUsage() {
@@ -250,6 +259,11 @@ public final class DreamBotJagexBulkImporter {
           progress.row(completedBefore + 1, total, "Row " + account.index + " " + status);
         } catch (CancellationException exception) {
           throw exception;
+        } catch (JagexCdpAutomation.TerminalAuthException exception) {
+          String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
+          log.accept("row " + account.index + " skipped: " + detail);
+          record(account, exception.status(), detail, 0, null);
+          progress.row(completedBefore + 1, total, "Row " + account.index + " " + exception.status());
         } catch (Exception exception) {
           failures++;
           String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
