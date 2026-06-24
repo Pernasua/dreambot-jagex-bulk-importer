@@ -17,6 +17,7 @@ final class JagexCdpAutomation {
   private final Consumer<String> log;
   private final RunControl control;
   private String importMailCodeHelper = "";
+  private String lastHumanCheckDetail = "";
   private final String screenshotDir = System.getenv().getOrDefault("DREAMBOT_JAGEX_IMPORTER_SHOT_DIR",
       "/tmp/enroll-shots");
 
@@ -95,7 +96,8 @@ final class JagexCdpAutomation {
         if (humanChallengePresent(cdp, warmState)) {
           log.accept("warm profile hit a human-check page before launcher OAuth");
           if (!waitPastHumanCheck(cdp, "")) {
-            throw new IllegalStateException("human check did not clear while warming Jagex profile");
+            throw new IllegalStateException("human check did not clear while warming Jagex profile"
+                + humanCheckFailureSuffix());
           }
         }
       }
@@ -229,7 +231,8 @@ final class JagexCdpAutomation {
             humanLogged = true;
           }
           if (!waitPastHumanCheck(cdp, request.state)) {
-            throw new IllegalStateException("human check did not clear within " + humanCheckWaitMs + "ms");
+            throw new IllegalStateException("human check did not clear within " + humanCheckWaitMs + "ms"
+                + humanCheckFailureSuffix());
           }
           continue;
         }
@@ -298,7 +301,7 @@ final class JagexCdpAutomation {
         // A "choose how to verify" page (the account may have both email and authenticator 2FA):
         // when we already have a validated authenticator secret, prefer that path first. The
         // factory disables email 2FA best-effort, but if Jagex still offers both methods during
-        // import we want the more deterministic authenticator route, not the mailbox fallback.
+        // import we want the more deterministic authenticator route, not the mailbox route.
         if (preferAuthenticator
             && !codeInputReady(state)
             && !isAuthenticatorCodePage(wide)
@@ -615,7 +618,7 @@ final class JagexCdpAutomation {
           }
           if (!waitPastHumanCheck(cdp, "")) {
             throw new IllegalStateException("human check did not clear within " + humanCheckWaitMs
-                + "ms during authenticator enrollment");
+                + "ms during authenticator enrollment" + humanCheckFailureSuffix());
           }
           continue;
         }
@@ -1104,7 +1107,7 @@ final class JagexCdpAutomation {
           browser.reveal();
         }
         if (!waitPastHumanCheck(cdp, "")) {
-          throw new IllegalStateException("human check did not clear during login");
+          throw new IllegalStateException("human check did not clear during login" + humanCheckFailureSuffix());
         }
         continue;
       }
@@ -1234,7 +1237,7 @@ final class JagexCdpAutomation {
             browser.reveal();
           }
           if (!waitPastHumanCheck(cdp, "")) {
-            log.accept("disableEmailMfa: human check did not clear");
+            log.accept("disableEmailMfa: human check did not clear" + humanCheckFailureSuffix());
             return;
           }
           continue;
@@ -1394,63 +1397,186 @@ final class JagexCdpAutomation {
   }
 
   private boolean humanChallengePresent(CdpClient cdp, State state) {
-    String combined = (state.text + " " + deepInnerText(cdp)).toLowerCase(Locale.ROOT);
-    if (matches(combined, "are you a robot|verify you are human|security check|checking your browser"
-        + "|turnstile|captcha|cloudflare")) {
-      return true;
-    }
+    return humanChallengeProbe(cdp, state).present;
+  }
+
+  private HumanCheckProbe humanChallengeProbe(CdpClient cdp, State state) {
+    String deep = "";
+    String errors = "";
     try {
+      deep = deepInnerText(cdp);
+    } catch (RuntimeException exception) {
+      errors = " deep_text_error=" + brief(exception.getMessage());
+    }
+    String combined = (state.text + " " + deep).toLowerCase(Locale.ROOT);
+    String textReason = firstHumanCheckTextReason(combined);
+    if (!textReason.isEmpty()) {
+      return new HumanCheckProbe(true, humanProbeDetail(state, "text:" + textReason, "", "", errors));
+    }
+
+    String targetInfo = "";
+    try {
+      int matchingTargets = 0;
+      String first = "";
       for (CdpClient.Target target : CdpClient.targets(browser.endpoint)) {
         String targetText = (target.type + " " + target.title + " " + target.url).toLowerCase(Locale.ROOT);
         if ("iframe".equalsIgnoreCase(target.type)
             && matches(targetText, "cloudflare|challenge|turnstile|captcha|human|verify")) {
-          return true;
+          matchingTargets++;
+          if (first.isEmpty()) {
+            first = brief(target.title + " " + target.url);
+          }
         }
       }
-    } catch (Exception ignored) {
-      // Fall through to the DOM probe.
-    }
-    try {
-      Object domChallenge = cdp.evaluate("(() => Array.from(document.querySelectorAll('iframe')).some((iframe)=>{"
-          + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ').toLowerCase();"
-          + "const r=iframe.getBoundingClientRect();"
-          + "return r.width>0&&r.height>0&&/cloudflare|challenge|turnstile|captcha|human|verify/.test(joined);"
-          + "}))()");
-      if (Boolean.TRUE.equals(domChallenge)) {
-        return true;
+      if (matchingTargets > 0) {
+        targetInfo = " target_iframe_matches=" + matchingTargets + " first_target=" + first;
+        return new HumanCheckProbe(true, humanProbeDetail(state, "target-iframe", targetInfo, "", errors));
       }
-    } catch (RuntimeException ignored) {
-      // Best effort only.
+      targetInfo = " target_iframe_matches=0";
+    } catch (Exception exception) {
+      targetInfo = " target_probe_error=" + brief(exception.getMessage());
     }
-    return false;
+
+    String domInfo = "";
+    try {
+      Map<String, Object> domChallenge = Json.asObject(cdp.evaluate("(() => {"
+          + "const visible=(el)=>{if(!el)return false;const s=getComputedStyle(el);"
+          + "if(s.visibility==='hidden'||s.display==='none')return false;"
+          + "const r=el.getBoundingClientRect();return r.width>0&&r.height>0;};"
+          + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe)=>{"
+          + "const r=iframe.getBoundingClientRect();"
+          + "return {title:String(iframe.title||''),name:String(iframe.name||''),id:String(iframe.id||''),"
+          + "src:String(iframe.src||''),aria:String(iframe.getAttribute('aria-label')||''),"
+          + "w:Math.round(r.width),h:Math.round(r.height)};});"
+          + "const matches=frames.filter((frame)=>/cloudflare|challenge|turnstile|captcha|human|verify/i"
+          + ".test([frame.title,frame.name,frame.id,frame.src,frame.aria].join(' ')));"
+          + "return {visible:frames.length,matches:matches.length,first:matches[0]||null};"
+          + "})()"));
+      int visible = Json.number(domChallenge.get("visible")).intValue();
+      int matches = Json.number(domChallenge.get("matches")).intValue();
+      domInfo = " dom_iframes=" + visible + " dom_matches=" + matches;
+      if (matches > 0) {
+        String first = brief(Json.stringify(domChallenge.get("first")));
+        domInfo += " first_dom_iframe=" + first;
+        return new HumanCheckProbe(true, humanProbeDetail(state, "dom-iframe", targetInfo, domInfo, errors));
+      }
+    } catch (RuntimeException exception) {
+      domInfo = " dom_probe_error=" + brief(exception.getMessage());
+    }
+    return new HumanCheckProbe(false, humanProbeDetail(state, "none", targetInfo, domInfo, errors));
+  }
+
+  private String firstHumanCheckTextReason(String text) {
+    String[][] checks = new String[][] {
+        {"are-you-a-robot", "are you a robot"},
+        {"verify-human", "verify you are human|confirm you are human|i am human|i.m human"},
+        {"security-check", "security check"},
+        {"checking-browser", "checking your browser"},
+        {"turnstile", "turnstile"},
+        {"captcha", "captcha"},
+        {"cloudflare", "cloudflare"}
+    };
+    for (String[] check : checks) {
+      if (matches(text, check[1])) {
+        return check[0];
+      }
+    }
+    return "";
+  }
+
+  private String humanProbeDetail(State state, String reason, String targetInfo, String domInfo, String errors) {
+    int textChars = state.text == null ? 0 : state.text.length();
+    return "reason=" + reason
+        + " href=" + brief(state.href)
+        + " title=" + brief(state.title)
+        + " text_chars=" + textChars
+        + " inputs=" + state.inputs.size()
+        + " actions=" + state.actions.size()
+        + targetInfo
+        + domInfo
+        + errors;
   }
 
   private boolean waitPastHumanCheck(CdpClient cdp, String expectedState) {
     long deadline = System.currentTimeMillis() + humanCheckWaitMs;
+    long started = System.currentTimeMillis();
     long lastClick = 0L;
+    long lastProbeLog = 0L;
+    int checks = 0;
+    int clickAttempts = 0;
+    String lastClickResult = "none";
+    HumanCheckProbe lastProbe = new HumanCheckProbe(false, "no probe yet");
+    lastHumanCheckDetail = "";
+    log.accept("human-check wait started; timeout " + humanCheckWaitMs + "ms");
     while (System.currentTimeMillis() < deadline) {
       control.checkpoint();
-      State state = readState(cdp);
+      State state;
+      try {
+        state = readState(cdp);
+      } catch (RuntimeException exception) {
+        lastHumanCheckDetail = "state read failed during human-check wait: " + brief(exception.getMessage());
+        log.accept("human-check state read failed: " + brief(exception.getMessage()));
+        throw exception;
+      }
       if (callback(state, cdp.observedUrls(), expectedState) != null) {
+        log.accept("human-check wait ended because OAuth callback was observed after "
+            + (System.currentTimeMillis() - started) + "ms");
         return true;
       }
-      if (!humanChallengePresent(cdp, state)) {
-        return true;
-      }
+      checks++;
+      HumanCheckProbe probe = humanChallengeProbe(cdp, state);
+      lastProbe = probe;
       long now = System.currentTimeMillis();
+      lastHumanCheckDetail = probe.detail + "; last_click=" + lastClickResult;
+      if (checks == 1 || now - lastProbeLog >= 5_000L) {
+        log.accept("human-check probe #" + checks + ": present=" + probe.present + " " + probe.detail
+            + "; last_click=" + lastClickResult);
+        lastProbeLog = now;
+      }
+      if (!probe.present) {
+        log.accept("human-check cleared after " + (now - started) + "ms, checks=" + checks
+            + ", click_attempts=" + clickAttempts + ", last_click=" + lastClickResult);
+        return true;
+      }
       if (now - lastClick >= 5_000L) {
-        String clicked = clickHumanCheckProceed(cdp);
-        if (!clicked.isEmpty()) {
-          log.accept("clicked human-check " + clicked);
-          lastClick = now;
-          sleep(2_000);
-          continue;
+        clickAttempts++;
+        if (clickAttempts == 1 || clickAttempts % 3 == 0) {
+          screenshot(cdp, "human-check-" + String.format(Locale.ROOT, "%03d", clickAttempts));
+        }
+        log.accept("human-check click attempt " + clickAttempts + " starting; " + probe.detail);
+        try {
+          String clicked = clickHumanCheckProceed(cdp);
+          if (!clicked.isEmpty()) {
+            lastClickResult = "attempt " + clickAttempts + " clicked " + clicked;
+            lastHumanCheckDetail = probe.detail + "; last_click=" + lastClickResult;
+            log.accept("human-check click attempt " + clickAttempts + " clicked " + clicked);
+            lastClick = now;
+            sleep(2_000);
+            continue;
+          }
+          lastClickResult = "attempt " + clickAttempts + " found no clickable target";
+          lastHumanCheckDetail = probe.detail + "; last_click=" + lastClickResult;
+          log.accept("human-check click attempt " + clickAttempts + " found no clickable target; "
+              + probe.detail);
+        } catch (RuntimeException exception) {
+          lastClickResult = "attempt " + clickAttempts + " failed: " + brief(exception.getMessage());
+          lastHumanCheckDetail = probe.detail + "; last_click=" + lastClickResult;
+          log.accept("human-check click attempt " + clickAttempts + " failed: "
+              + brief(exception.getMessage()));
         }
         lastClick = now;
       }
       sleep(1_000);
     }
+    lastHumanCheckDetail = "timed out after " + (System.currentTimeMillis() - started)
+        + "ms; checks=" + checks + "; click_attempts=" + clickAttempts
+        + "; last_probe=" + lastProbe.detail + "; last_click=" + lastClickResult;
+    log.accept("human-check timeout: " + lastHumanCheckDetail);
     return false;
+  }
+
+  private String humanCheckFailureSuffix() {
+    return lastHumanCheckDetail.isEmpty() ? "" : "; " + lastHumanCheckDetail;
   }
 
   private State readState(CdpClient cdp) {
@@ -1572,7 +1698,7 @@ final class JagexCdpAutomation {
         + "return String(el.value||'')===" + Json.quote(value) + ";"
         + "})()");
     if (!Boolean.TRUE.equals(filled)) {
-      Object fallback = cdp.evaluate("(() => {"
+      Object valueSet = cdp.evaluate("(() => {"
           + visibleHelpers()
           + "const selectors=" + Json.stringify(selectors) + ";"
           + "const el=candidates(selectors)[0];"
@@ -1580,7 +1706,7 @@ final class JagexCdpAutomation {
           + "setValue(el," + Json.quote(value) + ");"
           + "return true;"
           + "})()");
-      if (!Boolean.TRUE.equals(fallback)) {
+      if (!Boolean.TRUE.equals(valueSet)) {
         throw new IllegalStateException("could not fill visible input on Jagex login page");
       }
     }
@@ -1736,11 +1862,11 @@ final class JagexCdpAutomation {
   private String clickHumanCheckProceed(CdpClient cdp) {
     String clicked = clickHumanCheckProceedInContext(cdp, true);
     if (!clicked.isEmpty()) {
-      return clicked;
+      return "main " + clicked;
     }
-    clicked = clickHumanCheckIframeFallback(cdp);
+    clicked = clickHumanCheckFrameByBounds(cdp);
     if (!clicked.isEmpty()) {
-      return clicked;
+      return "main " + clicked;
     }
     try {
       for (CdpClient.Target target : CdpClient.targets(browser.endpoint)) {
@@ -1756,10 +1882,10 @@ final class JagexCdpAutomation {
           frame.send("Network.enable");
           clicked = clickHumanCheckProceedInContext(frame, false);
           if (clicked.isEmpty()) {
-            clicked = clickHumanCheckIframeFallback(frame);
+            clicked = clickHumanCheckFrameByBounds(frame);
           }
           if (!clicked.isEmpty()) {
-            return "iframe " + clicked;
+            return "iframe-target " + clicked;
           }
         } catch (RuntimeException exception) {
           log.accept("could not click human-check iframe target: " + brief(exception.getMessage()));
@@ -1771,7 +1897,7 @@ final class JagexCdpAutomation {
     return "";
   }
 
-  private String clickHumanCheckIframeFallback(CdpClient cdp) {
+  private String clickHumanCheckFrameByBounds(CdpClient cdp) {
     Map<String, Object> point = Json.asObject(cdp.evaluate("(() => {"
         + visibleHelpers()
         + "const frame=Array.from(document.querySelectorAll('iframe')).filter(visible).find((iframe)=>{"
@@ -1803,7 +1929,7 @@ final class JagexCdpAutomation {
       cdp.send("Input.dispatchMouseEvent", mouse("mouseReleased", px, py, "left", 1));
       sleep(250);
     }
-    return "challenge frame fallback";
+    return "challenge frame bounds";
   }
 
   private String clickHumanCheckProceedInContext(CdpClient cdp, boolean includeIframes) {
@@ -1916,7 +2042,7 @@ final class JagexCdpAutomation {
         + "const r=button.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};"
         + "})()"));
     if (button.isEmpty()) {
-      // Some flows auto-submit once the final digit is entered; press Enter as a fallback.
+      // Some flows auto-submit once the final digit is entered; press Enter when no submit control is visible.
       pressEnter(cdp);
       return true;
     }
@@ -2069,7 +2195,7 @@ final class JagexCdpAutomation {
         typedLength = visibleInputValueLength(cdp, directSelectors);
       }
       if (typedLength < code.length()) {
-        Object fallback = cdp.evaluate("(() => {"
+        Object valueSet = cdp.evaluate("(() => {"
             + deepHelper
             + "const selectors=" + Json.stringify(directSelectors) + ";"
             + "const el=candidates(selectors)[0];"
@@ -2077,7 +2203,7 @@ final class JagexCdpAutomation {
             + "setValue(el," + Json.quote(code) + ");"
             + "return true;"
             + "})()");
-        if (Boolean.TRUE.equals(fallback)) {
+        if (Boolean.TRUE.equals(valueSet)) {
           sleep(250);
           typedLength = visibleInputValueLength(cdp, directSelectors);
         }
@@ -2098,23 +2224,23 @@ final class JagexCdpAutomation {
       }
       log.accept("direct code input value length " + typedLength + "/" + code.length());
       if (typedLength < code.length()) {
-        log.accept("direct code input did not retain the full code; trying deep input fallback");
+        log.accept("direct code input did not retain the full code; trying deep input path");
       } else {
-      Map<String, Object> button = Json.asObject(cdp.evaluate("(() => {"
-          + deepHelper
-          + "const button=deep('button,input[type=\"submit\"],[role=\"button\"]').filter(visible)"
-          + ".find((el)=>{const text=normalize(el.innerText||el.value||el.getAttribute('aria-label')||el.textContent);"
-          + "const disabled=el.disabled||el.getAttribute('aria-disabled')==='true';"
-          + "return !disabled&&/continue|verify|submit|confirm|next/i.test(text);});"
-          + "if(!button)return null;button.scrollIntoView({block:'center',inline:'center'});"
-          + "const r=button.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};"
-          + "})()"));
-      if (button.isEmpty()) {
-        pressEnter(cdp);
-      } else {
-        clickPoint(cdp, button);
-      }
-      return true;
+        Map<String, Object> button = Json.asObject(cdp.evaluate("(() => {"
+            + deepHelper
+            + "const button=deep('button,input[type=\"submit\"],[role=\"button\"]').filter(visible)"
+            + ".find((el)=>{const text=normalize(el.innerText||el.value||el.getAttribute('aria-label')||el.textContent);"
+            + "const disabled=el.disabled||el.getAttribute('aria-disabled')==='true';"
+            + "return !disabled&&/continue|verify|submit|confirm|next/i.test(text);});"
+            + "if(!button)return null;button.scrollIntoView({block:'center',inline:'center'});"
+            + "const r=button.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};"
+            + "})()"));
+        if (button.isEmpty()) {
+          pressEnter(cdp);
+        } else {
+          clickPoint(cdp, button);
+        }
+        return true;
       }
     }
     Map<String, Object> target = Json.asObject(cdp.evaluate("(() => {"
@@ -2469,6 +2595,16 @@ final class JagexCdpAutomation {
           inputs,
           actions,
           links);
+    }
+  }
+
+  private static final class HumanCheckProbe {
+    final boolean present;
+    final String detail;
+
+    HumanCheckProbe(boolean present, String detail) {
+      this.present = present;
+      this.detail = detail;
     }
   }
 }

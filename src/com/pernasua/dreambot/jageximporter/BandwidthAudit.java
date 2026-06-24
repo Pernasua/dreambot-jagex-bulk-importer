@@ -200,8 +200,8 @@ final class BandwidthAudit {
     return out;
   }
 
-  private static String safe(String value, String fallback) {
-    return value == null ? fallback : value;
+  private static String safe(String value, String defaultValue) {
+    return value == null ? defaultValue : value;
   }
 
   private static final class Record {

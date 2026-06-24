@@ -26,10 +26,13 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 final class DreamBotAccountStore {
-  private static final byte[] TINK_PREFIX = hex("0148966ee1");
+  static final byte[] TINK_PREFIX = hex("0148966ee1");
   private static final byte[] AES_GCM_KEY = hex("5499df0e05a05f80e9b8d779bb7316b9080652830fa5e406c13c74ad95c54be2");
-  private static final byte[] AAD = ByteBuffer.allocate(4).putInt(152984).array();
-  private static final int NONCE_BYTES = 12;
+  static final int BUILT_IN_AAD_INT = 152984;
+  private static final int AAD_SCAN_START = 0;
+  private static final int AAD_SCAN_END = 2_000_000;
+  static final int NONCE_BYTES = 12;
+  private static final Map<String, Integer> AAD_CACHE = new LinkedHashMap<>();
   private static final SecureRandom RANDOM = new SecureRandom();
   private static final DateTimeFormatter BACKUP_STAMP =
       DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC);
@@ -38,7 +41,8 @@ final class DreamBotAccountStore {
   }
 
   static Info info(Path db) throws IOException, GeneralSecurityException {
-    return new Info(read(db).size());
+    DecodedStore decoded = readDecoded(db);
+    return new Info(decoded.rows.size(), codecLabel(decoded.aad), decoded.aad);
   }
 
   static BackupContext backupContext() {
@@ -52,7 +56,8 @@ final class DreamBotAccountStore {
     Files.createDirectories(db.toAbsolutePath().getParent());
     try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         FileLock ignored = channel.lock()) {
-      ArrayList<Map<String, Object>> rows = new ArrayList<>(read(db));
+      DecodedStore decoded = readDecoded(db);
+      ArrayList<Map<String, Object>> rows = new ArrayList<>(decoded.rows);
       int before = rows.size();
       Set<String> characterIds = new HashSet<>();
       Set<String> labels = new HashSet<>();
@@ -82,7 +87,7 @@ final class DreamBotAccountStore {
         return new AddResult(before, rows.size(), 0, List.of(), null);
       }
       Path backup = backupContext == null ? backup(db) : backupContext.ensure(db);
-      write(db, rows);
+      write(db, rows, decoded.aad);
       int persisted = verifyPersistedCount(db, rows.size());
       return new AddResult(before, persisted, addedLabels.size(), addedLabels, backup);
     }
@@ -94,7 +99,8 @@ final class DreamBotAccountStore {
     Files.createDirectories(db.toAbsolutePath().getParent());
     try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         FileLock ignored = channel.lock()) {
-      ArrayList<Map<String, Object>> rows = new ArrayList<>(read(db));
+      DecodedStore decoded = readDecoded(db);
+      ArrayList<Map<String, Object>> rows = new ArrayList<>(decoded.rows);
       int before = rows.size();
       String usernameKey = account.email.toLowerCase(Locale.ROOT);
       for (Map<String, Object> row : rows) {
@@ -105,21 +111,70 @@ final class DreamBotAccountStore {
       }
       rows.add(classicRecord(account, nickname(account, profile)));
       Path backup = backupContext == null ? backup(db) : backupContext.ensure(db);
-      write(db, rows);
+      write(db, rows, decoded.aad);
       int persisted = verifyPersistedCount(db, rows.size());
       return new AddResult(before, persisted, 1, List.of(account.email), backup);
     }
   }
 
   static List<Map<String, Object>> read(Path db) throws IOException, GeneralSecurityException {
+    return readDecoded(db).rows;
+  }
+
+  private static DecodedStore readDecoded(Path db) throws IOException, GeneralSecurityException {
     if (!Files.isRegularFile(db)) {
       throw new IllegalArgumentException("accounts.db does not exist: " + db);
     }
     byte[] encrypted = Files.readAllBytes(db);
     if (encrypted.length == 0) {
-      return new ArrayList<>();
+      return new DecodedStore(new ArrayList<>(), BUILT_IN_AAD_INT);
     }
-    byte[] plain = decrypt(encrypted);
+    DecodeAttempt failure = null;
+    int checked = 0;
+    Integer cached = cachedAad(db);
+    if (cached != null) {
+      DecodeAttempt attempt = tryDecode(encrypted, cached);
+      checked++;
+      if (attempt.rows != null) {
+        return new DecodedStore(attempt.rows, cached);
+      }
+      failure = attempt;
+    }
+    if (cached == null || cached != BUILT_IN_AAD_INT) {
+      DecodeAttempt attempt = tryDecode(encrypted, BUILT_IN_AAD_INT);
+      checked++;
+      if (attempt.rows != null) {
+        rememberAad(db, BUILT_IN_AAD_INT);
+        return new DecodedStore(attempt.rows, BUILT_IN_AAD_INT);
+      }
+      failure = attempt;
+    }
+    int rangeStart = Math.max(0, Math.min(AAD_SCAN_START, AAD_SCAN_END));
+    int rangeEnd = Math.max(AAD_SCAN_START, AAD_SCAN_END);
+    for (int aad = rangeStart; aad <= rangeEnd; aad++) {
+      if ((cached != null && aad == cached) || aad == BUILT_IN_AAD_INT) {
+        continue;
+      }
+      DecodeAttempt attempt = tryDecode(encrypted, aad);
+      checked++;
+      if (attempt.rows != null) {
+        rememberAad(db, aad);
+        return new DecodedStore(attempt.rows, aad);
+      }
+      failure = attempt;
+    }
+    throw unsupportedDbException(db, encrypted, failure == null ? null : failure.failure, checked);
+  }
+
+  private static DecodeAttempt tryDecode(byte[] encrypted, int aad) {
+    try {
+      return new DecodeAttempt(parseRows(decrypt(encrypted, aad)), null);
+    } catch (GeneralSecurityException | RuntimeException exception) {
+      return new DecodeAttempt(null, exception);
+    }
+  }
+
+  private static ArrayList<Map<String, Object>> parseRows(byte[] plain) {
     Object parsed = Json.parse(new String(plain, StandardCharsets.UTF_8));
     ArrayList<Map<String, Object>> rows = new ArrayList<>();
     for (Object item : Json.asList(parsed)) {
@@ -128,9 +183,10 @@ final class DreamBotAccountStore {
     return rows;
   }
 
-  private static void write(Path db, List<Map<String, Object>> rows) throws IOException, GeneralSecurityException {
+  private static void write(Path db, List<Map<String, Object>> rows, int aad)
+      throws IOException, GeneralSecurityException {
     byte[] plain = Json.stringify(rows).getBytes(StandardCharsets.UTF_8);
-    byte[] encrypted = encrypt(plain);
+    byte[] encrypted = encrypt(plain, aad);
     Path tmp = db.resolveSibling(db.getFileName() + ".tmp-" + ProcessHandle.current().pid());
     Files.write(tmp, encrypted, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
     try {
@@ -144,7 +200,12 @@ final class DreamBotAccountStore {
   }
 
   static void writeForTest(Path db, List<Map<String, Object>> rows) throws IOException, GeneralSecurityException {
-    write(db, rows);
+    write(db, rows, BUILT_IN_AAD_INT);
+  }
+
+  static void writeForTest(Path db, List<Map<String, Object>> rows, int aad)
+      throws IOException, GeneralSecurityException {
+    write(db, rows, aad);
   }
 
   private static int verifyPersistedCount(Path db, int expected) throws IOException, GeneralSecurityException {
@@ -204,7 +265,43 @@ final class DreamBotAccountStore {
     return backup;
   }
 
-  private static byte[] decrypt(byte[] encrypted) throws GeneralSecurityException {
+  private static GeneralSecurityException unsupportedDbException(Path db, byte[] encrypted, Exception builtInFailure,
+      int checked) {
+    StringBuilder message = new StringBuilder();
+    message.append("accounts.db could not be decrypted. ");
+    if (hasTinkPrefix(encrypted)) {
+      message.append("It has the DreamBot/Tink prefix ")
+          .append(hex(TINK_PREFIX))
+          .append(", but it did not authenticate with any scanned AAD value. ");
+    } else {
+      message.append("It does not have the expected DreamBot/Tink prefix ")
+          .append(hex(TINK_PREFIX))
+          .append(". ");
+    }
+    message.append("Checked ").append(checked).append(" AAD value(s). ")
+        .append("Close DreamBot and copy BotData/accounts.db again. ")
+        .append("If DreamBot can read this same file, this likely means DreamBot rotated the account-store key, not just the AAD. ")
+        .append("File: ").append(db.toAbsolutePath().normalize());
+    GeneralSecurityException exception = new GeneralSecurityException(message.toString());
+    if (builtInFailure != null) {
+      exception.initCause(builtInFailure);
+    }
+    return exception;
+  }
+
+  private static boolean hasTinkPrefix(byte[] encrypted) {
+    if (encrypted.length < TINK_PREFIX.length) {
+      return false;
+    }
+    for (int i = 0; i < TINK_PREFIX.length; i++) {
+      if (encrypted[i] != TINK_PREFIX[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static byte[] decrypt(byte[] encrypted, int aadInt) throws GeneralSecurityException {
     if (encrypted.length < TINK_PREFIX.length + NONCE_BYTES + 16) {
       throw new GeneralSecurityException("accounts.db is too short to be a DreamBot account database");
     }
@@ -217,16 +314,16 @@ final class DreamBotAccountStore {
     byte[] ciphertext = java.util.Arrays.copyOfRange(encrypted, TINK_PREFIX.length + NONCE_BYTES, encrypted.length);
     Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
     cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(AES_GCM_KEY, "AES"), new GCMParameterSpec(128, nonce));
-    cipher.updateAAD(AAD);
+    cipher.updateAAD(aadBytes(aadInt));
     return cipher.doFinal(ciphertext);
   }
 
-  private static byte[] encrypt(byte[] plain) throws GeneralSecurityException {
+  private static byte[] encrypt(byte[] plain, int aadInt) throws GeneralSecurityException {
     byte[] nonce = new byte[NONCE_BYTES];
     RANDOM.nextBytes(nonce);
     Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
     cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(AES_GCM_KEY, "AES"), new GCMParameterSpec(128, nonce));
-    cipher.updateAAD(AAD);
+    cipher.updateAAD(aadBytes(aadInt));
     byte[] ciphertext = cipher.doFinal(plain);
     byte[] out = new byte[TINK_PREFIX.length + nonce.length + ciphertext.length];
     System.arraycopy(TINK_PREFIX, 0, out, 0, TINK_PREFIX.length);
@@ -235,7 +332,31 @@ final class DreamBotAccountStore {
     return out;
   }
 
-  private static byte[] hex(String value) {
+  private static byte[] aadBytes(int aadInt) {
+    return ByteBuffer.allocate(4).putInt(aadInt).array();
+  }
+
+  private static Integer cachedAad(Path db) {
+    synchronized (AAD_CACHE) {
+      return AAD_CACHE.get(cacheKey(db));
+    }
+  }
+
+  private static void rememberAad(Path db, int aad) {
+    synchronized (AAD_CACHE) {
+      AAD_CACHE.put(cacheKey(db), aad);
+    }
+  }
+
+  private static String cacheKey(Path db) {
+    return db.toAbsolutePath().normalize().toString();
+  }
+
+  private static String codecLabel(int aad) {
+    return aad == BUILT_IN_AAD_INT ? "built-in" : "aes-gcm-aad";
+  }
+
+  static byte[] hex(String value) {
     byte[] out = new byte[value.length() / 2];
     for (int i = 0; i < out.length; i++) {
       out[i] = (byte) Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16);
@@ -243,11 +364,43 @@ final class DreamBotAccountStore {
     return out;
   }
 
+  static String hex(byte[] value) {
+    StringBuilder out = new StringBuilder(value.length * 2);
+    for (byte item : value) {
+      out.append(String.format("%02x", item & 0xff));
+    }
+    return out.toString();
+  }
+
   static final class Info {
     final int count;
+    final String codec;
+    final Integer aad;
 
-    Info(int count) {
+    Info(int count, String codec, Integer aad) {
       this.count = count;
+      this.codec = codec;
+      this.aad = aad;
+    }
+  }
+
+  private static final class DecodeAttempt {
+    final ArrayList<Map<String, Object>> rows;
+    final Exception failure;
+
+    DecodeAttempt(ArrayList<Map<String, Object>> rows, Exception failure) {
+      this.rows = rows;
+      this.failure = failure;
+    }
+  }
+
+  private static final class DecodedStore {
+    final List<Map<String, Object>> rows;
+    final int aad;
+
+    DecodedStore(List<Map<String, Object>> rows, int aad) {
+      this.rows = rows;
+      this.aad = aad;
     }
   }
 

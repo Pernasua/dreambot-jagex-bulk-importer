@@ -74,7 +74,7 @@ final class CdpClient implements AutoCloseable {
   }
 
   static String pageWebSocket(String baseUrl) throws IOException, InterruptedException {
-    String fallback = "";
+    String firstPage = "";
     for (Target target : targets(baseUrl)) {
       if (target.webSocketUrl.isEmpty() || !"page".equalsIgnoreCase(target.type)) {
         continue;
@@ -86,12 +86,12 @@ final class CdpClient implements AutoCloseable {
           || target.url.startsWith("jagex:")) {
         return target.webSocketUrl;
       }
-      if (fallback.isEmpty()) {
-        fallback = target.webSocketUrl;
+      if (firstPage.isEmpty()) {
+        firstPage = target.webSocketUrl;
       }
     }
-    if (!fallback.isEmpty()) {
-      return fallback;
+    if (!firstPage.isEmpty()) {
+      return firstPage;
     }
     throw new IllegalStateException("no browser page target was exposed by DevTools");
   }

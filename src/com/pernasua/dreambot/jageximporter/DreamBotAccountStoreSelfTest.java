@@ -29,6 +29,10 @@ final class DreamBotAccountStoreSelfTest {
 
       DreamBotAccountStore.writeForTest(db, List.of(Map.of("nickname", "existing", "username", "existing")));
       assertCount(db, 1);
+
+      DreamBotAccountStore.writeForTest(db,
+          List.of(Map.of("nickname", "new-aad", "username", "new-aad")), 256615);
+      assertInfo(db, 1, 256615);
     } finally {
       Files.deleteIfExists(db);
       Files.deleteIfExists(dir.resolve("accounts.db.lock"));
@@ -40,9 +44,17 @@ final class DreamBotAccountStoreSelfTest {
   }
 
   private static void assertCount(Path db, int expected) throws Exception {
-    int actual = DreamBotAccountStore.info(db).count;
-    if (actual != expected) {
-      throw new AssertionError("expected " + expected + " account(s), found " + actual);
+    assertInfo(db, expected, null);
+  }
+
+  private static void assertInfo(Path db, int expectedCount, Integer expectedAad) throws Exception {
+    DreamBotAccountStore.Info info = DreamBotAccountStore.info(db);
+    int actual = info.count;
+    if (actual != expectedCount) {
+      throw new AssertionError("expected " + expectedCount + " account(s), found " + actual);
+    }
+    if (expectedAad != null && !expectedAad.equals(info.aad)) {
+      throw new AssertionError("expected AAD " + expectedAad + ", found " + info.aad);
     }
   }
 }

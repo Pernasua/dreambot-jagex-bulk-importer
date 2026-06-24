@@ -5,6 +5,8 @@ import java.awt.Desktop;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
@@ -22,6 +24,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,6 +37,7 @@ import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.swing.JButton;
+import javax.swing.BorderFactory;
 import javax.swing.JCheckBox;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
@@ -42,10 +46,12 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
+import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
+import javax.swing.table.DefaultTableModel;
 
 public final class DreamBotJagexBulkImporter {
   private static final long DEFAULT_HUMAN_CHECK_WAIT_MS = 300_000L;
@@ -58,15 +64,15 @@ public final class DreamBotJagexBulkImporter {
   private DreamBotJagexBulkImporter() {
   }
 
-  private static int positiveEnvInt(String name, int fallback) {
+  private static int positiveEnvInt(String name, int defaultValue) {
     String raw = String.valueOf(System.getenv(name) == null ? "" : System.getenv(name)).trim();
     if (raw.isEmpty()) {
-      return fallback;
+      return defaultValue;
     }
     try {
       return Math.max(1, Integer.parseInt(raw));
     } catch (NumberFormatException ignored) {
-      return fallback;
+      return defaultValue;
     }
   }
 
@@ -84,18 +90,20 @@ public final class DreamBotJagexBulkImporter {
 
   private static int runMain(String[] args) throws Exception {
     List<String> argv = new ArrayList<>(Arrays.asList(args));
-    if (argv.isEmpty() || argv.contains("--gui")) {
+    if (argv.isEmpty() || "--gui".equals(argv.get(0))) {
+      if (!argv.isEmpty()) {
+        requireArgCount(argv, 1, "--gui");
+      }
       SwingUtilities.invokeLater(() -> new Gui().show());
       return 0;
     }
-    if (argv.contains("--help") || argv.contains("-h")) {
+    if ("--help".equals(argv.get(0)) || "-h".equals(argv.get(0))) {
+      requireArgCount(argv, 1, argv.get(0));
       printUsage();
       return 0;
     }
     if ("--totp".equals(argv.get(0))) {
-      if (argv.size() < 2) {
-        throw new IllegalArgumentException("--totp requires a base32 secret");
-      }
+      requireArgCount(argv, 2, "--totp");
       Totp.Code code = generateFreshTotp(argv.get(1));
       LinkedHashMap<String, Object> out = new LinkedHashMap<>();
       out.put("code", code.value);
@@ -105,25 +113,31 @@ public final class DreamBotJagexBulkImporter {
       return 0;
     }
     if ("--db-info".equals(argv.get(0))) {
+      requireArgCount(argv, 2, "--db-info");
       Path db = Paths.get(requireValue(argv, 1, "--db-info"));
       DreamBotAccountStore.Info info = DreamBotAccountStore.info(db);
       LinkedHashMap<String, Object> out = new LinkedHashMap<>();
       out.put("ok", true);
       out.put("accounts", info.count);
+      out.put("codec", info.codec);
+      out.put("aad", info.aad);
       System.out.println(Json.stringify(out));
       return 0;
     }
+    if ("--db-browser".equals(argv.get(0))) {
+      requireArgCount(argv, 2, "--db-browser");
+      Path db = Paths.get(requireValue(argv, 1, "--db-browser"));
+      DreamBotAccountStore.info(db);
+      SwingUtilities.invokeLater(() -> showAccountsDbBrowser(db));
+      return 0;
+    }
     if ("--browser-check".equals(argv.get(0))) {
-      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
+          "browser-engine", "browser", "jcef-dir", "devtools-port", "headless", "headed"));
       String browser = options.getOrDefault("browser", "");
       BrowserEngine engine = browser.isEmpty()
           ? BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"))
           : BrowserEngine.parse(options.getOrDefault("browser-engine", "system"));
-      if (options.containsKey("system-browser")) {
-        engine = BrowserEngine.SYSTEM;
-      } else if (options.containsKey("embedded-browser")) {
-        engine = BrowserEngine.JCEF;
-      }
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
       Boolean headless = null;
       if (options.containsKey("headless")) {
@@ -147,7 +161,7 @@ public final class DreamBotJagexBulkImporter {
       return 0;
     }
     if ("--page-state".equals(argv.get(0))) {
-      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of("devtools-port"));
       int port = Integer.parseInt(options.getOrDefault("devtools-port", "0"));
       if (port <= 0) {
         throw new IllegalArgumentException("--page-state requires --devtools-port");
@@ -160,7 +174,10 @@ public final class DreamBotJagexBulkImporter {
       return 0;
     }
     if ("--enroll-only".equals(argv.get(0))) {
-      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
+          "input", "account", "browser-engine", "browser", "user-data-dir", "jcef-dir",
+          "devtools-port", "human-check-wait-ms", "headless", "headed", "ledger",
+          "mail-code-helper"));
       List<String> rows = new ArrayList<>();
       if (options.containsKey("input")) {
         for (String line : Files.readAllLines(Paths.get(options.get("input")), StandardCharsets.UTF_8)) {
@@ -177,11 +194,6 @@ public final class DreamBotJagexBulkImporter {
         throw new IllegalArgumentException("--enroll-only requires --input PATH or --account email:password");
       }
       BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
-      if (options.containsKey("system-browser")) {
-        engine = BrowserEngine.SYSTEM;
-      } else if (options.containsKey("embedded-browser")) {
-        engine = BrowserEngine.JCEF;
-      }
       String browserPath = options.getOrDefault("browser", "");
       Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
@@ -249,7 +261,9 @@ public final class DreamBotJagexBulkImporter {
       return ok == rows.size() ? 0 : 1;
     }
     if ("--disable-email-only".equals(argv.get(0))) {
-      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
+          "account", "browser-engine", "browser", "user-data-dir", "jcef-dir",
+          "devtools-port", "human-check-wait-ms", "headless", "headed", "mail-code-helper"));
       String account = options.get("account");
       if (account == null || account.isEmpty()) {
         throw new IllegalArgumentException("--disable-email-only requires --account email:password:secret");
@@ -262,11 +276,6 @@ public final class DreamBotJagexBulkImporter {
         throw new IllegalArgumentException("--account must be email:password:secret");
       }
       BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
-      if (options.containsKey("system-browser")) {
-        engine = BrowserEngine.SYSTEM;
-      } else if (options.containsKey("embedded-browser")) {
-        engine = BrowserEngine.JCEF;
-      }
       String browserPath = options.getOrDefault("browser", "");
       Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
@@ -316,12 +325,16 @@ public final class DreamBotJagexBulkImporter {
         "  java -jar dreambot-jagex-bulk-importer.jar --stdin --db accounts.db [options]",
         "  java -jar dreambot-jagex-bulk-importer.jar --gui",
         "  java -jar dreambot-jagex-bulk-importer.jar --db-info accounts.db",
+        "  java -jar dreambot-jagex-bulk-importer.jar --db-browser accounts.db",
         "  java -jar dreambot-jagex-bulk-importer.jar --browser-check [--browser-engine jcef|system]",
         "  java -jar dreambot-jagex-bulk-importer.jar --page-state --devtools-port N",
+        "  java -jar dreambot-jagex-bulk-importer.jar --enroll-only --input accounts.txt",
+        "  java -jar dreambot-jagex-bulk-importer.jar --disable-email-only --account email:password:secret",
+        "  java -jar dreambot-jagex-bulk-importer.jar --totp SECRET",
         "",
         "Input rows use: username:password:otp-secret",
         "",
-        "Options:",
+        "Import options:",
         "  --input PATH              Account list file",
         "  --stdin                   Read account rows from stdin",
         "  --db PATH                 DreamBot BotData/accounts.db to update",
@@ -329,10 +342,8 @@ public final class DreamBotJagexBulkImporter {
         "  --end N                   Last 1-based source row to import (default: last row)",
         "  --ledger PATH             Non-secret JSONL result ledger",
         "  --browser-engine NAME     jcef/default embedded browser, or system Chrome/Edge",
-        "  --embedded-browser        Use the embedded JCEF browser (default)",
-        "  --system-browser          Use installed Chrome, Chromium, or Edge",
         "  --browser PATH            System Chrome, Chromium, or Edge executable",
-        "  --user-data-dir PATH      Reuse a system-browser profile directory",
+        "  --user-data-dir PATH      Reuse a system browser profile directory",
         "  --jcef-dir PATH           Embedded JCEF native-runtime cache directory",
         "  --headless                Run system browser headless; embedded JCEF starts minimized/internal",
         "  --headed                  Show the selected browser window",
@@ -341,6 +352,15 @@ public final class DreamBotJagexBulkImporter {
         "  --keep-browser-open       Leave browser open after import attempts",
         "  --allow-dreambot-running Bypass the DreamBot process guard for isolated DB copies",
         "  --dry-run                 Parse rows, validate TOTP, and decrypt DB without importing",
+        "  --mail-code-helper PATH   Helper used when login needs an email verification code",
+        "",
+        "Utility options:",
+        "  --db-info PATH            Print encrypted accounts.db count, codec, and AAD",
+        "  --db-browser PATH         Open a masked accounts.db table view",
+        "  --browser-check           Launch the configured browser and report DevTools status",
+        "  --page-state              Print current page state from --devtools-port",
+        "  --enroll-only             Enroll authenticators; accepts --input or --account",
+        "  --disable-email-only      Disable email MFA for --account email:password:secret",
         "  --totp SECRET             Utility mode: print the current generated TOTP code"));
   }
 
@@ -413,7 +433,7 @@ public final class DreamBotJagexBulkImporter {
 
         DreamBotAccountStore.Info info = DreamBotAccountStore.info(config.db);
         expectedDbCount = info.count;
-        log.accept("DB opened: " + info.count + " accounts");
+        log.accept("DB opened: " + info.count + " accounts, AAD " + info.aad);
         log.accept("Loaded " + rows.size() + " account row(s); importing rows " + config.start + "-" + end);
         log.accept("Ledger: " + config.ledger + " (JSONL row-status audit; not used as the account database)");
         log.accept("Bandwidth: " + config.bandwidthOut + " (JSON summary for browser/API traffic)");
@@ -788,14 +808,6 @@ public final class DreamBotJagexBulkImporter {
             config.browserEngine = BrowserEngine.parse(requireValue(argv, ++i, arg));
             engineExplicit = true;
             break;
-          case "--embedded-browser":
-            config.browserEngine = BrowserEngine.JCEF;
-            engineExplicit = true;
-            break;
-          case "--system-browser":
-            config.browserEngine = BrowserEngine.SYSTEM;
-            engineExplicit = true;
-            break;
           case "--browser":
             config.browserPath = requireValue(argv, ++i, arg);
             if (!engineExplicit) {
@@ -843,9 +855,115 @@ public final class DreamBotJagexBulkImporter {
     }
   }
 
+  private static void showAccountsDbBrowser(Path db) {
+    try {
+      List<Map<String, Object>> rows = DreamBotAccountStore.read(db);
+      JFrame frame = new JFrame("accounts.db browser - " + rows.size() + " account"
+          + (rows.size() == 1 ? "" : "s"));
+      frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+
+      JLabel summary = new JLabel(rows.size() + " account" + (rows.size() == 1 ? "" : "s")
+          + " in " + db.toAbsolutePath().normalize() + " (secret values masked)");
+      JTable table = new JTable(accountsDbTableModel(rows));
+      table.setAutoCreateRowSorter(true);
+      table.setFillsViewportHeight(true);
+      table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+      setColumnWidths(table);
+
+      JPanel content = new JPanel(new BorderLayout(8, 8));
+      content.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
+      content.add(summary, BorderLayout.NORTH);
+      content.add(new JScrollPane(table), BorderLayout.CENTER);
+
+      frame.setContentPane(content);
+      frame.setSize(1180, 640);
+      frame.setLocationRelativeTo(null);
+      frame.setVisible(true);
+    } catch (Exception exception) {
+      throw new IllegalStateException("could not read accounts.db: " + exception.getMessage(), exception);
+    }
+  }
+
+  private static DefaultTableModel accountsDbTableModel(List<Map<String, Object>> rows) {
+    String[] columns = new String[] {
+        "#", "Type", "Nickname", "Username", "SSO Email", "Character ID", "Banned",
+        "Password", "PIN", "TOTP", "Session", "Access Token", "Refresh Token", "Other Fields"
+    };
+    Object[][] data = new Object[rows.size()][columns.length];
+    for (int i = 0; i < rows.size(); i++) {
+      Map<String, Object> row = rows.get(i);
+      data[i][0] = i + 1;
+      data[i][1] = accountRowType(row);
+      data[i][2] = displayValue(row, "nickname");
+      data[i][3] = displayValue(row, "username");
+      data[i][4] = displayValue(row, "ssoEmail");
+      data[i][5] = displayValue(row, "characterId");
+      data[i][6] = displayValue(row, "banned");
+      data[i][7] = storedMarker(row, "password");
+      data[i][8] = storedMarker(row, "pin");
+      data[i][9] = storedMarker(row, "totp");
+      data[i][10] = storedMarker(row, "sessionId");
+      data[i][11] = storedMarker(row, "accessToken");
+      data[i][12] = storedMarker(row, "refreshToken");
+      data[i][13] = otherFieldNames(row);
+    }
+    return new DefaultTableModel(data, columns) {
+      @Override
+      public boolean isCellEditable(int row, int column) {
+        return false;
+      }
+
+      @Override
+      public Class<?> getColumnClass(int columnIndex) {
+        return columnIndex == 0 ? Integer.class : String.class;
+      }
+    };
+  }
+
+  private static String accountRowType(Map<String, Object> row) {
+    if (!Json.string(row.get("ssoEmail")).isEmpty()
+        || !Json.string(row.get("characterId")).isEmpty()
+        || !Json.string(row.get("refreshToken")).isEmpty()) {
+      return "Jagex";
+    }
+    return "Legacy";
+  }
+
+  private static String displayValue(Map<String, Object> row, String key) {
+    return truncateForTable(Json.string(row.get(key)));
+  }
+
+  private static String storedMarker(Map<String, Object> row, String key) {
+    String value = Json.string(row.get(key));
+    return value.isEmpty() ? "" : "<stored>";
+  }
+
+  private static String otherFieldNames(Map<String, Object> row) {
+    ArrayList<String> keys = new ArrayList<>(row.keySet());
+    keys.removeAll(List.of(
+        "nickname", "username", "ssoEmail", "characterId", "banned",
+        "password", "pin", "totp", "sessionId", "accessToken", "refreshToken", "ssoPassword", "expiresAt"));
+    Collections.sort(keys);
+    return String.join(", ", keys);
+  }
+
+  private static String truncateForTable(String value) {
+    String clean = value == null ? "" : value.replaceAll("\\s+", " ").trim();
+    return clean.length() <= 140 ? clean : clean.substring(0, 140) + "...";
+  }
+
+  private static void setColumnWidths(JTable table) {
+    int[] widths = new int[] {48, 76, 220, 220, 220, 160, 80, 80, 64, 64, 84, 96, 96, 220};
+    for (int i = 0; i < widths.length && i < table.getColumnModel().getColumnCount(); i++) {
+      table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+    }
+  }
+
   private static final class Gui {
     private final JTextField input = new JTextField();
     private final JTextField db = new JTextField();
+    private final JLabel dbCount = new JLabel("No DB selected");
+    private final JButton viewDb = new JButton("View DB");
     private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JCheckBox keepBrowserOpen = new JCheckBox("Keep browser open");
@@ -865,10 +983,19 @@ public final class DreamBotJagexBulkImporter {
 
       JPanel form = new JPanel(new GridBagLayout());
       addRow(form, 0, "Accounts file", input, chooserButton(input, false));
-      addRow(form, 1, "accounts.db", db, chooserButton(db, false));
+      addDbRow(form, 1);
       addRow(form, 2, "Browser engine", engine);
       engine.addActionListener(event -> updateEngineFields());
       updateEngineFields();
+      viewDb.setEnabled(false);
+      db.addActionListener(event -> refreshDbCount());
+      db.addFocusListener(new FocusAdapter() {
+        @Override
+        public void focusLost(FocusEvent event) {
+          refreshDbCount();
+        }
+      });
+      viewDb.addActionListener(event -> showSelectedAccountsDb());
 
       JPanel buttons = new JPanel();
       start.addActionListener(event -> start());
@@ -901,18 +1028,25 @@ public final class DreamBotJagexBulkImporter {
     }
 
     private JButton chooserButton(JTextField target, boolean save) {
+      return chooserButton(target, save, null);
+    }
+
+    private JButton chooserButton(JTextField target, boolean save, Runnable afterSelect) {
       JButton button = new JButton("Browse");
       button.addActionListener(event -> {
         JFileChooser chooser = new JFileChooser();
         int result = save ? chooser.showSaveDialog(null) : chooser.showOpenDialog(null);
         if (result == JFileChooser.APPROVE_OPTION) {
           target.setText(chooser.getSelectedFile().toString());
+          if (afterSelect != null) {
+            afterSelect.run();
+          }
         }
       });
       return button;
     }
 
-    private void addRow(JPanel panel, int y, String label, JTextField field, JButton browse) {
+    private void addRow(JPanel panel, int y, String label, JTextField field, java.awt.Component action) {
       GridBagConstraints c = new GridBagConstraints();
       c.gridy = y;
       c.insets = new Insets(4, 6, 4, 6);
@@ -925,7 +1059,15 @@ public final class DreamBotJagexBulkImporter {
       c.gridx = 2;
       c.weightx = 0;
       c.fill = GridBagConstraints.NONE;
-      panel.add(browse, c);
+      panel.add(action, c);
+    }
+
+    private void addDbRow(JPanel panel, int y) {
+      JPanel actions = new JPanel();
+      actions.add(chooserButton(db, false, this::refreshDbCount));
+      actions.add(viewDb);
+      actions.add(dbCount);
+      addRow(panel, y, "accounts.db", db, actions);
     }
 
     private void addRow(JPanel panel, int y, String label, JComboBox<String> comboBox) {
@@ -944,6 +1086,46 @@ public final class DreamBotJagexBulkImporter {
     private void updateEngineFields() {
       boolean embedded = engine.getSelectedIndex() == 0;
       headless.setText(embedded ? "Minimized/internal browser" : "Headless system browser");
+    }
+
+    private Path selectedDbPath() {
+      String path = db.getText().trim();
+      return path.isEmpty() ? null : Paths.get(path);
+    }
+
+    private void refreshDbCount() {
+      Path path = selectedDbPath();
+      if (path == null) {
+        dbCount.setText("No DB selected");
+        dbCount.setToolTipText(null);
+        viewDb.setEnabled(false);
+        return;
+      }
+      try {
+        DreamBotAccountStore.Info info = DreamBotAccountStore.info(path);
+        dbCount.setText(info.count + " account" + (info.count == 1 ? "" : "s"));
+        dbCount.setToolTipText("accounts.db AAD " + info.aad + " (" + info.codec + ")");
+        viewDb.setEnabled(true);
+      } catch (Exception exception) {
+        dbCount.setText("Unreadable DB");
+        dbCount.setToolTipText(exception.getMessage());
+        viewDb.setEnabled(false);
+        status.setText("Could not read accounts.db: " + exception.getMessage());
+      }
+    }
+
+    private void showSelectedAccountsDb() {
+      Path path = selectedDbPath();
+      if (path == null) {
+        status.setText("Select accounts.db first");
+        return;
+      }
+      try {
+        showAccountsDbBrowser(path);
+        refreshDbCount();
+      } catch (RuntimeException exception) {
+        status.setText("Could not open accounts.db browser: " + exception.getMessage());
+      }
     }
 
     private void start() {
@@ -1344,7 +1526,21 @@ public final class DreamBotJagexBulkImporter {
     return argv.get(index);
   }
 
-  private static Map<String, String> parseOptions(List<String> argv) {
+  private static void requireArgCount(List<String> argv, int expected, String mode) {
+    if (argv.size() < expected) {
+      throw new IllegalArgumentException(mode + " requires a value");
+    }
+    if (argv.size() > expected) {
+      int values = expected - 1;
+      if (values == 0) {
+        throw new IllegalArgumentException(mode + " does not accept additional arguments");
+      }
+      throw new IllegalArgumentException(mode + " accepts exactly " + values
+          + (values == 1 ? " value" : " values"));
+    }
+  }
+
+  private static Map<String, String> parseOptions(List<String> argv, Set<String> allowedKeys) {
     LinkedHashMap<String, String> options = new LinkedHashMap<>();
     for (int i = 0; i < argv.size(); i++) {
       String arg = argv.get(i);
@@ -1352,6 +1548,9 @@ public final class DreamBotJagexBulkImporter {
         throw new IllegalArgumentException("unknown argument: " + arg);
       }
       String key = arg.substring(2);
+      if (!allowedKeys.contains(key)) {
+        throw new IllegalArgumentException("unknown option: " + arg);
+      }
       if (i + 1 >= argv.size() || argv.get(i + 1).startsWith("--")) {
         options.put(key, "true");
       } else {
