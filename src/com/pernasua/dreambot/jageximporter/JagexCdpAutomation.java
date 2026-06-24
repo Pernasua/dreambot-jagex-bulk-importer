@@ -12,6 +12,8 @@ import java.util.regex.Pattern;
 
 final class JagexCdpAutomation {
   private static final List<String> BLOCKED_URL_PATTERNS = blockedUrlPatterns();
+  private static final String HUMAN_CHECK_FRAME_PATTERN =
+      "cloudflare|challenge|turnstile|captcha|human|verify|sso|security|portal|assisted-login|account\\.jagex";
   private final BrowserSession browser;
   private final long humanCheckWaitMs;
   private final Consumer<String> log;
@@ -61,51 +63,21 @@ final class JagexCdpAutomation {
       String password, String otpSecret) throws Exception {
     control.checkpoint();
     browser.prepareAuthRequest(request);
-    boolean nativeJcefNavigation = browser.engine == BrowserEngine.JCEF;
-    boolean launcherFlow = request.url.contains("flow=launcher");
-    boolean directOpenNavigation = !nativeJcefNavigation && request.url.contains("prompt=consent");
-    if (nativeJcefNavigation) {
+    boolean nativeNavigation = "jcef".equals(browser.engine);
+    if (nativeNavigation) {
       browser.navigate(request.url);
       sleep(6_000);
     }
-    CdpClient cdp = directOpenNavigation ? openPage(request.url) : openPage();
+    CdpClient cdp = openPage();
     try {
       if (!request.referrer.isEmpty()) {
         LinkedHashMap<String, String> headers = new LinkedHashMap<>();
         headers.put("Referer", request.referrer);
         cdp.setExtraHttpHeaders(headers);
       }
-      if (!nativeJcefNavigation && launcherFlow) {
-        log.accept("probing Jagex reachability before launcher OAuth");
-        try {
-          cdp = waitForJagexReachability(cdp, "https://account.jagex.com/", 10_000L);
-        } catch (TemporaryOAuthException exception) {
-          // This probe is just a warm-up. If it flakes, the real manage/profile
-          // navigation below is the authoritative signal, so don't burn an entire
-          // fresh-browser retry on the probe alone.
-          log.accept("Jagex reachability probe failed but will continue to warm profile directly: "
-              + brief(exception.getMessage()));
-          cdp = reopenPageTarget(cdp, "https://account.jagex.com/");
-        }
-        log.accept("warming Jagex profile session before launcher OAuth");
-        navigateForOAuth(cdp, "https://account.jagex.com/en-GB/manage/profile",
-            "warm Jagex profile before launcher OAuth");
-        sleep(1_500);
-        State warmState = readStateWithReopen(cdp,
-            "https://account.jagex.com/en-GB/manage/profile",
-            "warm Jagex profile before launcher OAuth");
-        if (humanChallengePresent(cdp, warmState)) {
-          log.accept("warm profile hit a human-check page before launcher OAuth");
-          if (!waitPastHumanCheck(cdp, "")) {
-            throw new IllegalStateException("human check did not clear while warming Jagex profile"
-                + humanCheckFailureSuffix());
-          }
-        }
-      }
-      if (!nativeJcefNavigation && !directOpenNavigation) {
+      if (!nativeNavigation) {
         navigateForOAuth(cdp, request.url,
-            request.url.contains("flow=launcher") ? "launcher OAuth entry"
-                : "Jagex account consent OAuth");
+            request.url.contains("flow=launcher") ? "launcher OAuth entry" : "consent OAuth entry");
       }
       sleep(800);
       long totalWaitMs = Math.max(420_000L, humanCheckWaitMs + 180_000L);
@@ -132,7 +104,6 @@ final class JagexCdpAutomation {
       long sameStateSince = 0L;
       int reopenAttempts = 0;
       int blankConsentReloads = 0;
-      int browserErrorReopens = 0;
 
       while (System.currentTimeMillis() < deadline) {
         control.checkpoint();
@@ -172,25 +143,10 @@ final class JagexCdpAutomation {
         if (++importLoop % 8 == 1) {
           log.accept("oauth [" + (lastAction.isEmpty() ? "navigating" : lastAction) + "] @ "
               + brief(state.href) + " :: " + brief(state.text));
-          if (importLoop < 240) {
-            screenshot(cdp, "import-L" + String.format(Locale.ROOT, "%03d", importLoop));
-          }
         }
         if (state.href.startsWith("chrome-error://")
             || matches(text, "err_blocked_by_client|this page has been blocked by (chrome|chromium)"
                 + "|site can.t be reached|err_[a-z_]+")) {
-          if (!nativeJcefNavigation && launcherFlow && browserErrorReopens < 2) {
-            browserErrorReopens++;
-            log.accept("launcher OAuth hit browser error page; reopening page target directly "
-                + browserErrorReopens + "/2");
-            cdp = reopenPageTarget(cdp, request.url);
-            lastAction = "reopened launcher page after browser error";
-            lastActionAt = now;
-            lastStateFingerprint = "";
-            sameStateSince = 0L;
-            sleep(1_500);
-            continue;
-          }
           throw new TemporaryOAuthException("browser error page during Jagex OAuth: "
               + brief(state.href + " " + state.text));
         }
@@ -206,6 +162,9 @@ final class JagexCdpAutomation {
         }
         if (matches(text, "technical difficulties|try again later|temporarily unavailable|service unavailable")) {
           throw new TemporaryOAuthException("Jagex temporary OAuth page: " + brief(state.text));
+        }
+        if (isRateLimited(text)) {
+          throw new RateLimitedException("Jagex rate limited login: " + brief(state.text));
         }
         if (isAccountLocked(text)) {
           throw new TerminalAuthException("account_locked", "Jagex reported the account is locked");
@@ -225,10 +184,8 @@ final class JagexCdpAutomation {
         if (humanChallengePresent(cdp, state)) {
           if (!humanLogged) {
             log.accept("browser is waiting on Jagex/Cloudflare human-check page");
-            if (browser.engine == BrowserEngine.JCEF) {
-              browser.reveal();
-              log.accept("embedded JCEF browser was revealed for the human-check page");
-            }
+            browser.reveal();
+            log.accept("embedded JCEF browser was revealed for the human-check page");
             humanLogged = true;
           }
           if (!waitPastHumanCheck(cdp, request.state)) {
@@ -546,6 +503,9 @@ final class JagexCdpAutomation {
         sleep(650);
       }
       throw new TemporaryOAuthException("timed out waiting for Jagex OAuth callback after " + lastAction);
+    } catch (Exception exception) {
+      failureScreenshot(cdp, "oauth");
+      throw exception;
     } finally {
       cdp.close();
     }
@@ -559,18 +519,10 @@ final class JagexCdpAutomation {
    */
   String enrollAuthenticator(String email, String password, String mailCodeHelper) throws Exception {
     String securityUrl = "https://account.jagex.com/en-GB/manage";
-    // Mirror completeAuth: native JCEF navigation passes Cloudflare where a CDP-issued
-    // navigation does not (CDP-driven loads are more detectable to the challenge).
-    boolean nativeJcefNavigation = browser.engine == BrowserEngine.JCEF;
-    if (nativeJcefNavigation) {
-      browser.navigate(securityUrl);
-      sleep(6_000);
-    }
-    CdpClient cdp = openPage(securityUrl);
+    browser.navigate(securityUrl);
+    sleep(6_000);
+    CdpClient cdp = openPage();
     try {
-      if (!nativeJcefNavigation) {
-        sleep(800);
-      }
       long deadline = System.currentTimeMillis() + Math.max(420_000L, humanCheckWaitMs + 180_000L);
       boolean emailFilled = false;
       boolean passwordFilled = false;
@@ -580,7 +532,6 @@ final class JagexCdpAutomation {
       long lastCodeSubmitAt = 0L;
       int codeAttempts = 0;
       int loopCount = 0;
-      int shotCount = 0;
       int reopenAttempts = 0;
       long mailCodeAfter = 0L;
       String lastEmailCode = "";
@@ -607,16 +558,10 @@ final class JagexCdpAutomation {
         String text = state.text.toLowerCase(Locale.ROOT);
         if (++loopCount % 8 == 1) {
           log.accept("enroll [" + lastAction + "] @ " + brief(state.href) + " :: " + brief(state.text));
-          if (shotCount < 30) {
-            screenshot(cdp, "L" + String.format(Locale.ROOT, "%03d", loopCount));
-            shotCount++;
-          }
         }
 
         if (humanChallengePresent(cdp, state)) {
-          if (browser.engine == BrowserEngine.JCEF) {
-            browser.reveal();
-          }
+          browser.reveal();
           if (!waitPastHumanCheck(cdp, "")) {
             throw new IllegalStateException("human check did not clear within " + humanCheckWaitMs
                 + "ms during authenticator enrollment" + humanCheckFailureSuffix());
@@ -725,11 +670,7 @@ final class JagexCdpAutomation {
         }
 
         if (state.href.contains("/manage/oauth2/code")) {
-          if (browser.engine == BrowserEngine.JCEF) {
-            browser.navigate("https://account.jagex.com/en-GB/manage/profile");
-          } else {
-            cdp.navigate("https://account.jagex.com/en-GB/manage/profile");
-          }
+          browser.navigate("https://account.jagex.com/en-GB/manage/profile");
           lastAction = "followed manage oauth callback";
           sleep(1500);
           continue;
@@ -837,6 +778,9 @@ final class JagexCdpAutomation {
         return secret;
       }
       throw new IllegalStateException("timed out enrolling authenticator after " + lastAction);
+    } catch (Exception exception) {
+      failureScreenshot(cdp, "enroll");
+      throw exception;
     } finally {
       cdp.close();
     }
@@ -877,64 +821,10 @@ final class JagexCdpAutomation {
     } catch (Exception ignored) {
       // Best-effort cleanup only; the replacement target is what matters.
     }
-    CdpClient fresh = browser.engine == BrowserEngine.JCEF ? openPage() : openPage(url);
-    if (browser.engine == BrowserEngine.JCEF) {
-      fresh.navigate(url);
-      sleep(1_500);
-    } else {
-      sleep(1_200);
-    }
+    CdpClient fresh = openPage();
+    fresh.navigate(url);
+    sleep(1_500);
     return fresh;
-  }
-
-  private CdpClient waitForJagexReachability(CdpClient cdp, String url, long maxWaitMs)
-      throws Exception {
-    long deadline = System.currentTimeMillis() + Math.max(0L, maxWaitMs);
-    int attempt = 0;
-    while (System.currentTimeMillis() < deadline) {
-      attempt++;
-      try {
-        navigateForOAuth(cdp, url, "Jagex reachability probe");
-      } catch (TemporaryOAuthException exception) {
-        log.accept("Jagex reachability probe navigation timed out; reopening page target "
-            + attempt + " :: " + brief(exception.getMessage()));
-        cdp = reopenPageTarget(cdp, url);
-        sleep(1_200);
-        continue;
-      }
-      sleep(900);
-      State state = readStateWithReopen(cdp, url, "Jagex reachability probe");
-      String text = state.text.toLowerCase(Locale.ROOT);
-      if (!(state.href.startsWith("chrome-error://")
-          || matches(text, "err_blocked_by_client|this page has been blocked by (chrome|chromium)"
-              + "|site can.t be reached|err_[a-z_]+"))) {
-        return cdp;
-      }
-      log.accept("Jagex reachability probe hit browser error page; reopening page target "
-          + attempt);
-      cdp = reopenPageTarget(cdp, url);
-      sleep(1_200);
-    }
-    throw new TemporaryOAuthException("Jagex reachability probe timed out @ " + brief(url));
-  }
-
-  private State readStateWithReopen(CdpClient cdp, String url, String action) throws Exception {
-    RuntimeException last = null;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-      try {
-        return readState(cdp);
-      } catch (RuntimeException exception) {
-        last = exception;
-        if (!(isCdpTimeout(exception) || isClosedCdpTransport(exception)) || attempt >= 3) {
-          throw exception;
-        }
-        log.accept(action + " readState timed out; reopening page target "
-            + attempt + " :: " + brief(exception.getMessage()));
-        cdp = reopenPageTarget(cdp, url);
-        sleep(1_200);
-      }
-    }
-    throw last == null ? new IllegalStateException(action + " readState failed") : last;
   }
 
   private String fetchEmailCode(String email, String helper, long afterEpoch, String... excludedCodes) {
@@ -1002,6 +892,16 @@ final class JagexCdpAutomation {
     } catch (Exception exception) {
       log.accept("screenshot failed: " + brief(exception.getMessage()));
     }
+  }
+
+  private void failureScreenshot(CdpClient cdp, String label) {
+    String safeLabel = label == null ? "unknown" : label.toLowerCase(Locale.ROOT)
+        .replaceAll("[^a-z0-9._-]+", "-")
+        .replaceAll("(^-+|-+$)", "");
+    if (safeLabel.isEmpty()) {
+      safeLabel = "unknown";
+    }
+    screenshot(cdp, "failure-" + safeLabel + "-" + System.currentTimeMillis());
   }
 
   private String readEnrollmentText(CdpClient cdp) {
@@ -1079,129 +979,126 @@ final class JagexCdpAutomation {
     long lastEmailCodeAt = 0L;
     int emailCodeAttempts = 0;
     int loop = 0;
-    int shots = 0;
-    while (System.currentTimeMillis() < deadline) {
-      State state = readState(cdp);
-      String text = state.text.toLowerCase(Locale.ROOT);
-      if (++loop % 6 == 1 && shots < 18) {
-        log.accept("login @ " + brief(state.href) + " :: " + brief(state.text));
-        screenshot(cdp, "login-L" + String.format(Locale.ROOT, "%03d", loop));
-        shots++;
-      }
-      if (matches(text, "two-step authentication|security codes via authenticator|language preference")
-          && !matches(text, "enter (?:the )?(?:verification|security) code")
-          && !hasInput(state, "password")) {
-        return;
-      }
-      if (state.href.contains("/manage/oauth2/code")) {
-        if (browser.engine == BrowserEngine.JCEF) {
+    try {
+      while (System.currentTimeMillis() < deadline) {
+        State state = readState(cdp);
+        String text = state.text.toLowerCase(Locale.ROOT);
+        if (++loop % 6 == 1) {
+          log.accept("login @ " + brief(state.href) + " :: " + brief(state.text));
+        }
+        if (matches(text, "two-step authentication|security codes via authenticator|language preference")
+            && !matches(text, "enter (?:the )?(?:verification|security) code")
+            && !hasInput(state, "password")) {
+          return;
+        }
+        if (state.href.contains("/manage/oauth2/code")) {
           browser.navigate("https://account.jagex.com/en-GB/manage/profile");
-        } else {
-          cdp.navigate("https://account.jagex.com/en-GB/manage/profile");
+          sleep(1500);
+          continue;
         }
-        sleep(1500);
-        continue;
-      }
-      if (humanChallengePresent(cdp, state)) {
-        if (browser.engine == BrowserEngine.JCEF) {
+        if (humanChallengePresent(cdp, state)) {
           browser.reveal();
+          if (!waitPastHumanCheck(cdp, "")) {
+            throw new IllegalStateException("human check did not clear during login" + humanCheckFailureSuffix());
+          }
+          continue;
         }
-        if (!waitPastHumanCheck(cdp, "")) {
-          throw new IllegalStateException("human check did not clear during login" + humanCheckFailureSuffix());
+        if (!dismissCookieNotice(cdp, text).isEmpty()) {
+          sleep(500);
+          continue;
         }
-        continue;
-      }
-      if (!dismissCookieNotice(cdp, text).isEmpty()) {
-        sleep(500);
-        continue;
-      }
-      if (isAccountLocked(text)) {
-        throw new IllegalStateException("Jagex reported the account is locked");
-      }
-      if (isInvalidCredentials(text)) {
-        throw new IllegalStateException("Jagex login failed (invalid credentials): " + brief(state.text));
-      }
-      if (hasInput(state, "email") && !emailFilled) {
-        fillFirst(cdp, Arrays.asList("input[type='email']", "input[name='email']",
-            "input[id*='email' i]", "input[autocomplete='email']", "input"), email);
-        if (clickText(cdp, Arrays.asList("^continue$", "^next$", "^submit$", "^verify$")).isEmpty()) {
-          pressEnter(cdp);
+        if (isAccountLocked(text)) {
+          throw new IllegalStateException("Jagex reported the account is locked");
         }
-        emailFilled = true;
-        sleep(900);
-        continue;
-      }
-      if (hasInput(state, "password") && !passwordFilled) {
-        fillFirst(cdp, Arrays.asList("input[type='password']", "input[name='password']",
-            "input[id*='password' i]", "input[autocomplete='current-password']"), password);
-        if (clickText(cdp, Arrays.asList("^continue$", "^next$", "^submit$", "^verify$")).isEmpty()) {
-          pressEnter(cdp);
+        if (isInvalidCredentials(text)) {
+          throw new IllegalStateException("Jagex login failed (invalid credentials): " + brief(state.text));
         }
-        passwordFilled = true;
-        mailCodeAfter = System.currentTimeMillis() / 1000L - 5L;
-        sleep(1_100);
-        continue;
-      }
-      // 2FA method-selection ("Choose a way to verify it's you") — the account has both authenticator
-      // and email. Pick EMAIL: we read email codes, whereas the authenticator option is the unreachable
-      // shadow modal. (We disable email 2FA right after logging in, leaving authenticator-only.)
-      String wide = (text + " " + deepInnerText(cdp)).toLowerCase(Locale.ROOT);
-      if (!matches(text, "enter (?:the )?(?:verification|security) code|code sent to")
-          && (matches(wide, "choose a way to verify|verify it.?s you")
-              || (matches(wide, "use your authenticator app") && matches(wide, "send a code to your email")))) {
-        String picked = clickText(cdp, Arrays.asList(
-            "send a code to your email", "code to your email address", "to your email address"));
-        if (picked.isEmpty()) {
-          picked = clickExactButton(cdp, "^(send a code to your email address|use your email address|email address)$");
+        if (hasInput(state, "email") && !emailFilled) {
+          fillFirst(cdp, Arrays.asList("input[type='email']", "input[name='email']",
+              "input[id*='email' i]", "input[autocomplete='email']", "input"), email);
+          if (clickText(cdp, Arrays.asList("^continue$", "^next$", "^submit$", "^verify$")).isEmpty()) {
+            pressEnter(cdp);
+          }
+          emailFilled = true;
+          sleep(900);
+          continue;
         }
-        if (!picked.isEmpty()) {
+        if (hasInput(state, "password") && !passwordFilled) {
+          fillFirst(cdp, Arrays.asList("input[type='password']", "input[name='password']",
+              "input[id*='password' i]", "input[autocomplete='current-password']"), password);
+          if (clickText(cdp, Arrays.asList("^continue$", "^next$", "^submit$", "^verify$")).isEmpty()) {
+            pressEnter(cdp);
+          }
+          passwordFilled = true;
           mailCodeAfter = System.currentTimeMillis() / 1000L - 5L;
-          sleep(1_300);
+          sleep(1_100);
           continue;
         }
-      }
-      boolean emailLoginCodePage = !isAuthenticatorCodePage(text) && !matches(text, "authenticator")
-          && (matches(state.href, "email-code-verify") || isEmailCodePage(text)
-              || matches(text, "emailed you a verification code|enter the code sent to|code sent to [^ ]+@"));
-      if (emailLoginCodePage) {
-        if (mailCodeHelper == null || mailCodeHelper.isEmpty()) {
-          throw new IllegalStateException("Jagex requires an email login code but no mail-code helper");
-        }
-        if (emailCodeAttempts >= 4) {
-          throw new IllegalStateException("Jagex kept rejecting the emailed login code");
-        }
-        if (mailCodeAfter == 0L) {
-          mailCodeAfter = System.currentTimeMillis() / 1000L - 120L;
-        }
-        String code = fetchEmailCode(email, mailCodeHelper, mailCodeAfter, lastEmailCode);
-        if (code.isEmpty()) {
-          throw new IllegalStateException("no Jagex email login code arrived");
-        }
-        if (code.equalsIgnoreCase(lastEmailCode) && !isRejectedVerificationCode(text)
-            && System.currentTimeMillis() - lastEmailCodeAt < 8_000L) {
-          sleep(1_000);
-          continue;
-        }
-        boolean filled = false;
-        for (int t = 0; t < 5 && !filled; t++) {
-          filled = fillCodeDeep(cdp, code);
-          if (!filled) {
-            sleep(1_200);
+        // 2FA method-selection ("Choose a way to verify it's you") — the account has both authenticator
+        // and email. Pick EMAIL: we read email codes, whereas the authenticator option is the unreachable
+        // shadow modal. (We disable email 2FA right after logging in, leaving authenticator-only.)
+        String wide = (text + " " + deepInnerText(cdp)).toLowerCase(Locale.ROOT);
+        if (!matches(text, "enter (?:the )?(?:verification|security) code|code sent to")
+            && (matches(wide, "choose a way to verify|verify it.?s you")
+                || (matches(wide, "use your authenticator app") && matches(wide, "send a code to your email")))) {
+          String picked = clickText(cdp, Arrays.asList(
+              "send a code to your email", "code to your email address", "to your email address"));
+          if (picked.isEmpty()) {
+            picked = clickExactButton(cdp,
+                "^(send a code to your email address|use your email address|email address)$");
+          }
+          if (!picked.isEmpty()) {
+            mailCodeAfter = System.currentTimeMillis() / 1000L - 5L;
+            sleep(1_300);
+            continue;
           }
         }
-        if (!filled) {
-          sleep(800);
+        boolean emailLoginCodePage = !isAuthenticatorCodePage(text) && !matches(text, "authenticator")
+            && (matches(state.href, "email-code-verify") || isEmailCodePage(text)
+                || matches(text, "emailed you a verification code|enter the code sent to|code sent to [^ ]+@"));
+        if (emailLoginCodePage) {
+          if (mailCodeHelper == null || mailCodeHelper.isEmpty()) {
+            throw new IllegalStateException("Jagex requires an email login code but no mail-code helper");
+          }
+          if (emailCodeAttempts >= 4) {
+            throw new IllegalStateException("Jagex kept rejecting the emailed login code");
+          }
+          if (mailCodeAfter == 0L) {
+            mailCodeAfter = System.currentTimeMillis() / 1000L - 120L;
+          }
+          String code = fetchEmailCode(email, mailCodeHelper, mailCodeAfter, lastEmailCode);
+          if (code.isEmpty()) {
+            throw new IllegalStateException("no Jagex email login code arrived");
+          }
+          if (code.equalsIgnoreCase(lastEmailCode) && !isRejectedVerificationCode(text)
+              && System.currentTimeMillis() - lastEmailCodeAt < 8_000L) {
+            sleep(1_000);
+            continue;
+          }
+          boolean filled = false;
+          for (int t = 0; t < 5 && !filled; t++) {
+            filled = fillCodeDeep(cdp, code);
+            if (!filled) {
+              sleep(1_200);
+            }
+          }
+          if (!filled) {
+            sleep(800);
+            continue;
+          }
+          lastEmailCode = code;
+          lastEmailCodeAt = System.currentTimeMillis();
+          emailCodeAttempts++;
+          sleep(1_800);
           continue;
         }
-        lastEmailCode = code;
-        lastEmailCodeAt = System.currentTimeMillis();
-        emailCodeAttempts++;
-        sleep(1_800);
-        continue;
+        sleep(700);
       }
-      sleep(700);
+      throw new IllegalStateException("could not reach account management during login");
+    } catch (RuntimeException exception) {
+      failureScreenshot(cdp, "login");
+      throw exception;
     }
-    throw new IllegalStateException("could not reach account management during login");
   }
 
   // Best-effort: turn off email-based 2FA so the account is authenticator-only (the import login then
@@ -1209,34 +1106,25 @@ final class JagexCdpAutomation {
   void disableEmailMfa(CdpClient cdp, String secret) {
     try {
       String url = "https://account.jagex.com/en-GB/manage/profile";
-      if (browser.engine == BrowserEngine.JCEF) {
-        browser.navigate(url);
-        sleep(4_000);
-      } else {
-        cdp.navigate(url);
-        sleep(1_500);
-      }
+      browser.navigate(url);
+      sleep(4_000);
       long deadline = System.currentTimeMillis() + 150_000L;
       long lastCodeCounter = -1L;
       long lastCodeAt = 0L;
       int codeAttempts = 0;
       int loop = 0;
-      int shots = 0;
       String lastAction = "navigating";
       while (System.currentTimeMillis() < deadline) {
         State state = readState(cdp);
         String text = state.text.toLowerCase(Locale.ROOT);
         String all = (text + " " + deepInnerText(cdp)).toLowerCase(Locale.ROOT);
-        if (++loop % 6 == 1 && shots < 25) {
+        if (++loop % 6 == 1) {
           log.accept("disable-email [" + lastAction + "] @ " + brief(state.href) + " :: " + brief(state.text));
-          screenshot(cdp, "disable-L" + String.format(Locale.ROOT, "%03d", loop));
-          shots++;
         }
         if (humanChallengePresent(cdp, state)) {
-          if (browser.engine == BrowserEngine.JCEF) {
-            browser.reveal();
-          }
+          browser.reveal();
           if (!waitPastHumanCheck(cdp, "")) {
+            failureScreenshot(cdp, "disable-email-human-check");
             log.accept("disableEmailMfa: human check did not clear" + humanCheckFailureSuffix());
             return;
           }
@@ -1259,6 +1147,7 @@ final class JagexCdpAutomation {
             continue;
           }
           if (codeAttempts >= 5) {
+            failureScreenshot(cdp, "disable-email-code-attempts");
             log.accept("disableEmailMfa: confirm-code attempts exhausted");
             return;
           }
@@ -1295,8 +1184,10 @@ final class JagexCdpAutomation {
         }
         sleep(800);
       }
+      failureScreenshot(cdp, "disable-email-timeout");
       log.accept("disableEmailMfa: timed out (best-effort)");
     } catch (RuntimeException exception) {
+      failureScreenshot(cdp, "disable-email-error");
       log.accept("disableEmailMfa best-effort error: " + brief(exception.getMessage()));
     }
   }
@@ -1315,15 +1206,9 @@ final class JagexCdpAutomation {
   // Standalone: log in and disable email-2FA on an already-enrolled account (debug/repair path).
   String disableEmailOnly(String email, String password, String secret, String mailCodeHelper) throws Exception {
     String url = "https://account.jagex.com/";
-    boolean nativeJcefNavigation = browser.engine == BrowserEngine.JCEF;
-    if (nativeJcefNavigation) {
-      browser.navigate(url);
-      sleep(6_000);
-    }
-    try (CdpClient cdp = nativeJcefNavigation ? openPage() : openPage(url)) {
-      if (!nativeJcefNavigation) {
-        sleep(800);
-      }
+    browser.navigate(url);
+    sleep(6_000);
+    try (CdpClient cdp = openPage()) {
       loginToAccountManagement(cdp, email, password, mailCodeHelper);
       disableEmailMfa(cdp, secret);
       return "disabled";
@@ -1331,23 +1216,14 @@ final class JagexCdpAutomation {
   }
 
   private CdpClient openPage() throws Exception {
-    return openPage("about:blank");
-  }
-
-  private CdpClient openPage(String initialUrl) throws Exception {
     String ws;
-    String targetUrl = (initialUrl == null || initialUrl.isBlank()) ? "about:blank" : initialUrl;
-    if (browser.engine == BrowserEngine.JCEF) {
+    if ("system".equals(browser.engine)) {
+      ws = CdpClient.newPage(browser.endpoint, "about:blank");
+    } else {
       try {
         ws = CdpClient.pageWebSocket(browser.endpoint);
       } catch (Exception exception) {
         ws = CdpClient.newPage(browser.endpoint, "about:blank");
-      }
-    } else {
-      try {
-        ws = CdpClient.newPage(browser.endpoint, targetUrl);
-      } catch (Exception exception) {
-        ws = CdpClient.pageWebSocket(browser.endpoint);
       }
     }
     CdpClient cdp = CdpClient.connect(ws);
@@ -1553,9 +1429,6 @@ final class JagexCdpAutomation {
       }
       if (now - lastClick >= 5_000L) {
         clickAttempts++;
-        if (clickAttempts == 1 || clickAttempts % 3 == 0) {
-          screenshot(cdp, "human-check-" + String.format(Locale.ROOT, "%03d", clickAttempts));
-        }
         log.accept("human-check click attempt " + clickAttempts + " starting; " + probe.detail);
         try {
           String clicked = clickHumanCheckProceed(cdp);
@@ -1873,11 +1746,11 @@ final class JagexCdpAutomation {
   }
 
   private String clickHumanCheckProceed(CdpClient cdp) {
-    String clicked = clickHumanCheckProceedInContext(cdp, true);
+    String clicked = tryHumanCheckClick("main-context", cdp, () -> clickHumanCheckProceedInContext(cdp, true));
     if (!clicked.isEmpty()) {
       return "main " + clicked;
     }
-    clicked = clickHumanCheckFrameByBounds(cdp);
+    clicked = tryHumanCheckClick("frame-bounds", cdp, () -> clickHumanCheckFrameByBounds(cdp));
     if (!clicked.isEmpty()) {
       return "main " + clicked;
     }
@@ -1888,7 +1761,7 @@ final class JagexCdpAutomation {
         if (!"iframe".equalsIgnoreCase(target.type) || target.webSocketUrl.isEmpty()) {
           continue;
         }
-        if (!matches(targetText, "cloudflare|challenge|turnstile|captcha|human|verify")) {
+        if (!matches(targetText, HUMAN_CHECK_FRAME_PATTERN)) {
           genericIframeTargets.add(target);
           continue;
         }
@@ -1896,9 +1769,11 @@ final class JagexCdpAutomation {
           frame.send("Runtime.enable");
           frame.send("Page.enable");
           frame.send("Network.enable");
-          clicked = clickHumanCheckProceedInContext(frame, false);
+          clicked = tryHumanCheckClick("iframe-target-context", frame,
+              () -> clickHumanCheckProceedInContext(frame, false));
           if (clicked.isEmpty()) {
-            clicked = clickHumanCheckFrameByBounds(frame);
+            clicked = tryHumanCheckClick("iframe-target-bounds", frame,
+                () -> clickHumanCheckFrameByBounds(frame));
           }
           if (!clicked.isEmpty()) {
             return "iframe-target " + clicked;
@@ -1921,10 +1796,40 @@ final class JagexCdpAutomation {
     return "";
   }
 
-  private String clickNativeHumanCheck(CdpClient cdp) {
-    if (browser.engine != BrowserEngine.JCEF) {
+  private String tryHumanCheckClick(String strategy, CdpClient cdp, HumanCheckClick click) {
+    try {
+      return click.run();
+    } catch (RuntimeException exception) {
+      log.accept("human-check click strategy " + strategy + " failed: "
+          + brief(exception.getMessage()) + "; " + humanCheckFailureState(cdp));
       return "";
     }
+  }
+
+  private String humanCheckFailureState(CdpClient cdp) {
+    try {
+      Map<String, Object> state = Json.asObject(cdp.evaluate("(() => {"
+          + "const frames=Array.from(document.querySelectorAll('iframe')).map((iframe,index)=>{"
+          + "const r=iframe.getBoundingClientRect();"
+          + "return {index,title:iframe.title||'',name:iframe.name||'',id:iframe.id||'',"
+          + "src:iframe.src||'',aria:iframe.getAttribute('aria-label')||'',"
+          + "x:r.x,y:r.y,w:r.width,h:r.height};"
+          + "}).slice(0,5);"
+          + "const active=document.activeElement;"
+          + "return {href:location.href,title:document.title,ready:document.readyState,"
+          + "active:active?String(active.tagName||'').toLowerCase():'',frames};"
+          + "})()"));
+      return "state href=" + brief(Json.string(state.get("href")))
+          + " title=" + brief(Json.string(state.get("title")))
+          + " ready=" + brief(Json.string(state.get("ready")))
+          + " active=" + brief(Json.string(state.get("active")))
+          + " frames=" + brief(Json.stringify(state.get("frames")));
+    } catch (RuntimeException stateException) {
+      return "state unavailable: " + brief(stateException.getMessage());
+    }
+  }
+
+  private String clickNativeHumanCheck(CdpClient cdp) {
     List<Object> points;
     try {
       points = Json.asList(cdp.evaluate("(() => {"
@@ -1934,7 +1839,7 @@ final class JagexCdpAutomation {
           + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe,index)=>{"
           + "const r=iframe.getBoundingClientRect();"
           + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ');"
-          + "const match=/cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined)?1:0;"
+          + "const match=/" + HUMAN_CHECK_FRAME_PATTERN + "/i.test(joined)?1:0;"
           + "const central=1/(1+Math.abs((r.left+r.width/2)-(window.innerWidth||r.width)/2)"
           + "+Math.abs((r.top+r.height/2)-(window.innerHeight||r.height)/2));"
           + "const size=(r.width>=180&&r.width<=520&&r.height>=40&&r.height<=220)?1:0;"
@@ -1989,7 +1894,8 @@ final class JagexCdpAutomation {
         frame.send("Runtime.enable");
         frame.send("Page.enable");
         frame.send("Network.enable");
-        String clicked = clickHumanCheckProceedInContext(frame, false);
+        String clicked = tryHumanCheckClick("generic-iframe-context", frame,
+            () -> clickHumanCheckProceedInContext(frame, false));
         if (!clicked.isEmpty()) {
           attempted++;
           lastClick = clicked;
@@ -2012,14 +1918,14 @@ final class JagexCdpAutomation {
         + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe,index)=>{"
         + "const r=iframe.getBoundingClientRect();"
         + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ');"
-        + "const match=/cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined)?1:0;"
+        + "const match=/" + HUMAN_CHECK_FRAME_PATTERN + "/i.test(joined)?1:0;"
         + "const central=1/(1+Math.abs((r.left+r.width/2)-(window.innerWidth||r.width)/2)"
         + "+Math.abs((r.top+r.height/2)-(window.innerHeight||r.height)/2));"
         + "const size=(r.width>=180&&r.width<=520&&r.height>=40&&r.height<=220)?1:0;"
         + "return {iframe,index,match,score:match*10+size*3+central,x:r.left,y:r.top,w:r.width,h:r.height};"
         + "}).sort((a,b)=>b.score-a.score||a.index-b.index);"
         + "const frame=frames[0];"
-        + "if(!frame)return null;frame.scrollIntoView({block:'center',inline:'center'});"
+        + "if(!frame)return null;frame.iframe.scrollIntoView({block:'center',inline:'center'});"
         + "const r=frame.iframe.getBoundingClientRect();"
         + "return {x:r.left,y:r.top,w:r.width,h:r.height,match:frame.match,index:frame.index};"
         + "})()"));
@@ -2074,7 +1980,7 @@ final class JagexCdpAutomation {
         + (includeIframes ? ""
         + "const frame=Array.from(document.querySelectorAll('iframe')).filter(visible).find((iframe)=>{"
         + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ');"
-        + "return /cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined);});"
+        + "return /" + HUMAN_CHECK_FRAME_PATTERN + "/i.test(joined);});"
         + "if(frame){frame.scrollIntoView({block:'center',inline:'center'});const r=frame.getBoundingClientRect();"
         + "return {x:r.left+Math.min(38,Math.max(18,r.width*0.18)),y:r.top+r.height/2,label:'challenge frame'};}"
         : "")
@@ -2556,6 +2462,10 @@ final class JagexCdpAutomation {
     return matches(text, "account is locked|locked your account|account locked");
   }
 
+  private boolean isRateLimited(String text) {
+    return matches(text, "too many requests|tried to do that too many times|rate limit|too many attempts");
+  }
+
   private boolean isCookieNotice(String text) {
     return matches(text,
         "cookiebot|this website uses cookies|about this website uses cookies|consent details|manage cookies"
@@ -2661,8 +2571,18 @@ final class JagexCdpAutomation {
     control.sleep(millis);
   }
 
+  private interface HumanCheckClick {
+    String run();
+  }
+
   static final class TemporaryOAuthException extends Exception {
     TemporaryOAuthException(String message) {
+      super(message);
+    }
+  }
+
+  static final class RateLimitedException extends Exception {
+    RateLimitedException(String message) {
       super(message);
     }
   }

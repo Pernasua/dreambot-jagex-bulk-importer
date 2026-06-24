@@ -39,7 +39,6 @@ import javax.swing.BorderFactory;
 import javax.swing.JCheckBox;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
-import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
@@ -53,6 +52,7 @@ import javax.swing.table.DefaultTableModel;
 
 public final class DreamBotJagexBulkImporter {
   private static final long DEFAULT_HUMAN_CHECK_WAIT_MS = 300_000L;
+  private static final long DEFAULT_RATE_LIMIT_COOLDOWN_MS = TimeUnit.HOURS.toMillis(3);
   private static final int MAX_TEMPORARY_OAUTH_ATTEMPTS =
       positiveEnvInt("DREAMBOT_JAGEX_IMPORTER_TEMP_OAUTH_ATTEMPTS", 4);
   private static final Progress NO_PROGRESS = new Progress() { };
@@ -131,26 +131,15 @@ public final class DreamBotJagexBulkImporter {
     }
     if ("--browser-check".equals(argv.get(0))) {
       Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
-          "browser-engine", "browser", "jcef-dir", "devtools-port", "headless", "headed"));
-      String browser = options.getOrDefault("browser", "");
-      BrowserEngine engine = browser.isEmpty()
-          ? BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"))
-          : BrowserEngine.parse(options.getOrDefault("browser-engine", "system"));
+          "jcef-dir", "devtools-port", "headless", "headed", "proxy-file"));
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
-      Boolean headless = null;
-      if (options.containsKey("headless")) {
-        headless = isTruthy(options.get("headless"));
-      } else if (options.containsKey("headed")) {
-        headless = !isTruthy(options.get("headed"));
-      }
-      boolean effectiveHeadless = headless == null ? engine == BrowserEngine.JCEF : headless;
+      boolean headless = browserHeadless(options, true);
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
-      try (BrowserSession session = launchBrowser(engine, browser, jcefDir, port, false, effectiveHeadless,
-          null,
+      ProxyConfig proxy = firstProxy(proxyListFromOptions(options));
+      try (BrowserSession session = launchBrowser("jcef", "", jcefDir, port, false, headless, null, proxy,
           message -> System.err.println(sanitizeDiagnostic(message)))) {
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
-        out.put("engine", session.engine.label);
         out.put("headless", session.headless);
         out.put("port", session.port);
         out.put("targets", CdpClient.targets(session.endpoint).size());
@@ -173,9 +162,9 @@ public final class DreamBotJagexBulkImporter {
     }
     if ("--enroll-only".equals(argv.get(0))) {
       Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
-          "input", "account", "browser-engine", "browser", "user-data-dir", "jcef-dir",
+          "input", "account", "jcef-dir",
           "devtools-port", "human-check-wait-ms", "headless", "headed", "ledger",
-          "mail-code-helper"));
+          "mail-code-helper", "proxy-file"));
       List<String> rows = new ArrayList<>();
       if (options.containsKey("input")) {
         for (String line : Files.readAllLines(Paths.get(options.get("input")), StandardCharsets.UTF_8)) {
@@ -191,21 +180,14 @@ public final class DreamBotJagexBulkImporter {
       if (rows.isEmpty()) {
         throw new IllegalArgumentException("--enroll-only requires --input PATH or --account email:password");
       }
-      BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
-      String browserPath = options.getOrDefault("browser", "");
-      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
       long humanWait = options.containsKey("human-check-wait-ms")
           ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
-      boolean headless = engine == BrowserEngine.JCEF;
-      if (options.containsKey("headed")) {
-        headless = !isTruthy(options.get("headed"));
-      } else if (options.containsKey("headless")) {
-        headless = isTruthy(options.get("headless"));
-      }
+      boolean headless = browserHeadless(options, true);
       Path ledger = options.containsKey("ledger") ? Paths.get(options.get("ledger")) : null;
       Path bandwidthOut = ledger == null ? null : defaultBandwidth(ledger);
+      ProxyConfig proxy = firstProxy(proxyListFromOptions(options));
       String mailCodeHelper = options.getOrDefault("mail-code-helper",
           "/root/projects/dreambot/tools/2b2m_mail_code.py");
       int ok = 0;
@@ -221,8 +203,7 @@ public final class DreamBotJagexBulkImporter {
             System.err.println("skip malformed row " + displayIndex);
             continue;
           }
-          try (BrowserSession browser = launchBrowser(engine, browserPath, jcefDir, port, false, headless,
-              userDataDir,
+          try (BrowserSession browser = launchBrowser("jcef", "", jcefDir, port, false, headless, null, proxy,
               message -> System.err.println(sanitizeDiagnostic("row " + displayIndex + " " + message)))) {
             JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
                 message -> System.err.println(sanitizeDiagnostic("row " + displayIndex + " " + message)));
@@ -260,8 +241,9 @@ public final class DreamBotJagexBulkImporter {
     }
     if ("--disable-email-only".equals(argv.get(0))) {
       Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
-          "account", "browser-engine", "browser", "user-data-dir", "jcef-dir",
-          "devtools-port", "human-check-wait-ms", "headless", "headed", "mail-code-helper"));
+          "account", "jcef-dir",
+          "devtools-port", "human-check-wait-ms", "headless", "headed", "mail-code-helper",
+          "proxy-file"));
       String account = options.get("account");
       if (account == null || account.isEmpty()) {
         throw new IllegalArgumentException("--disable-email-only requires --account email:password:secret");
@@ -273,23 +255,15 @@ public final class DreamBotJagexBulkImporter {
       if (email.isEmpty() || password.isEmpty() || secret.isEmpty()) {
         throw new IllegalArgumentException("--account must be email:password:secret");
       }
-      BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
-      String browserPath = options.getOrDefault("browser", "");
-      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
       long humanWait = options.containsKey("human-check-wait-ms")
           ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
-      boolean headless = engine == BrowserEngine.JCEF;
-      if (options.containsKey("headed")) {
-        headless = !isTruthy(options.get("headed"));
-      } else if (options.containsKey("headless")) {
-        headless = isTruthy(options.get("headless"));
-      }
+      boolean headless = browserHeadless(options, true);
       String mailCodeHelper = options.getOrDefault("mail-code-helper",
           "/root/projects/dreambot/tools/2b2m_mail_code.py");
-      try (BrowserSession browser = launchBrowser(engine, browserPath, jcefDir, port, false, headless,
-          userDataDir,
+      ProxyConfig proxy = firstProxy(proxyListFromOptions(options));
+      try (BrowserSession browser = launchBrowser("jcef", "", jcefDir, port, false, headless, null, proxy,
           message -> System.err.println(sanitizeDiagnostic("disable-email " + message)))) {
         JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
             message -> System.err.println(sanitizeDiagnostic("disable-email " + message)));
@@ -316,6 +290,16 @@ public final class DreamBotJagexBulkImporter {
     return code;
   }
 
+  private static boolean browserHeadless(Map<String, String> options, boolean defaultValue) {
+    if (options.containsKey("headed")) {
+      return !isTruthy(options.get("headed"));
+    }
+    if (options.containsKey("headless")) {
+      return isTruthy(options.get("headless"));
+    }
+    return defaultValue;
+  }
+
   private static void printUsage() {
     System.out.println(String.join("\n",
         "Usage:",
@@ -324,7 +308,7 @@ public final class DreamBotJagexBulkImporter {
         "  java -jar dreambot-jagex-bulk-importer.jar --gui",
         "  java -jar dreambot-jagex-bulk-importer.jar --db-info accounts.db",
         "  java -jar dreambot-jagex-bulk-importer.jar --db-browser accounts.db",
-        "  java -jar dreambot-jagex-bulk-importer.jar --browser-check [--browser-engine jcef|system]",
+        "  java -jar dreambot-jagex-bulk-importer.jar --browser-check",
         "  java -jar dreambot-jagex-bulk-importer.jar --page-state --devtools-port N",
         "  java -jar dreambot-jagex-bulk-importer.jar --enroll-only --input accounts.txt",
         "  java -jar dreambot-jagex-bulk-importer.jar --disable-email-only --account email:password:secret",
@@ -339,14 +323,18 @@ public final class DreamBotJagexBulkImporter {
         "  --start N                 First 1-based source row to import (default: 1)",
         "  --end N                   Last 1-based source row to import (default: last row)",
         "  --ledger PATH             Non-secret JSONL result ledger",
-        "  --browser-engine NAME     jcef/default embedded browser, or system Chrome/Edge",
-        "  --browser PATH            System Chrome, Chromium, or Edge executable",
-        "  --user-data-dir PATH      Reuse a system browser profile directory",
+        "  --browser-engine NAME     Compatibility alias accepted for system or embedded browser callers",
+        "  --browser PATH            Compatibility alias accepted for callers that pass a browser binary",
+        "  --user-data-dir PATH      Compatibility alias accepted for callers that reuse a browser profile",
+        "  --system-browser          Compatibility alias for --browser-engine system",
+        "  --embedded-browser        Compatibility alias for --browser-engine jcef",
         "  --jcef-dir PATH           Embedded JCEF native-runtime cache directory",
-        "  --headless                Run system browser headless; embedded JCEF starts minimized/internal",
-        "  --headed                  Show the selected browser window",
+        "  --headless                Start embedded JCEF minimized/internal",
+        "  --headed                  Show the embedded JCEF browser window",
         "  --devtools-port N         Browser DevTools port (default: auto)",
         "  --human-check-wait-ms N   Max wait for browser challenge pages (default: 300000)",
+        "  --rate-limit-cooldown-minutes N  Wait before retrying after Jagex rate limits (default: 180)",
+        "  --proxy-file PATH         Proxy list file; one proxy per line as server|username|password",
         "  --keep-browser-open       Leave browser open after import attempts",
         "  --allow-dreambot-running Bypass the DreamBot process guard for isolated DB copies",
         "  --dry-run                 Parse rows, validate TOTP, and decrypt DB without importing",
@@ -355,7 +343,7 @@ public final class DreamBotJagexBulkImporter {
         "Utility options:",
         "  --db-info PATH            Print encrypted accounts.db count, codec, and AAD",
         "  --db-browser PATH         Open a full accounts.db table view",
-        "  --browser-check           Launch the configured browser and report DevTools status",
+        "  --browser-check           Launch embedded JCEF and report DevTools status",
         "  --page-state              Print current page state from --devtools-port",
         "  --enroll-only             Enroll authenticators; accepts --input or --account",
         "  --disable-email-only      Disable email MFA for --account email:password:secret",
@@ -370,13 +358,13 @@ public final class DreamBotJagexBulkImporter {
     }
   }
 
-  private static BrowserSession launchBrowser(BrowserEngine engine, String browserPath, Path jcefDir,
+  private static BrowserSession launchBrowser(String browserEngine, String browserPath, Path jcefDir,
       int devtoolsPort, boolean keepBrowserOpen, boolean headless, Path userDataDir,
-      Consumer<String> log) throws Exception {
-    if (engine == BrowserEngine.JCEF) {
-      return JcefBrowserLauncher.launch(jcefDir, devtoolsPort, keepBrowserOpen, headless, log);
+      ProxyConfig proxy, Consumer<String> log) throws Exception {
+    if ("system".equalsIgnoreCase(String.valueOf(browserEngine))) {
+      return BrowserLauncher.launch(browserPath, devtoolsPort, keepBrowserOpen, headless, userDataDir, proxy);
     }
-    return BrowserLauncher.launch(browserPath, devtoolsPort, keepBrowserOpen, headless, userDataDir);
+    return JcefBrowserLauncher.launch(jcefDir, devtoolsPort, keepBrowserOpen, headless, log, proxy);
   }
 
   private static final class Importer {
@@ -385,6 +373,8 @@ public final class DreamBotJagexBulkImporter {
     private final Progress progress;
     private final RunControl control;
     private final DreamBotAccountStore.BackupContext backupContext = DreamBotAccountStore.backupContext();
+    private final List<ProxyConfig> proxies;
+    private int proxyIndex;
     private int expectedDbCount = -1;
 
     Importer(Config config, Consumer<String> log) {
@@ -400,6 +390,7 @@ public final class DreamBotJagexBulkImporter {
       this.log = DiagnosticSanitizer.consumer(log);
       this.progress = progress == null ? NO_PROGRESS : progress;
       this.control = control == null ? RunControl.NONE : control;
+      this.proxies = config.proxies == null ? List.of() : new ArrayList<>(config.proxies);
     }
 
     int run() throws Exception {
@@ -446,7 +437,6 @@ public final class DreamBotJagexBulkImporter {
         }
 
         int failures = 0;
-        JagexOAuthClient oauth = new JagexOAuthClient(message -> log.accept(message));
         int total = end - config.start + 1;
         progress.total(total);
         for (int rowIndex = config.start; rowIndex <= end; rowIndex++) {
@@ -455,7 +445,7 @@ public final class DreamBotJagexBulkImporter {
           int completedBefore = rowIndex - config.start;
           progress.row(completedBefore, total, "Starting row " + account.index);
           try {
-            String status = importOne(oauth, account);
+            String status = importOne(account);
             progress.row(completedBefore + 1, total, "Row " + account.index + " " + status);
           } catch (CancellationException exception) {
             throw exception;
@@ -492,7 +482,7 @@ public final class DreamBotJagexBulkImporter {
       }
     }
 
-    private String importOne(JagexOAuthClient oauth, AccountRow account) throws Exception {
+    private String importOne(AccountRow account) throws Exception {
       control.checkpoint();
       account.validate();
       log.accept("row " + account.index + " start");
@@ -513,9 +503,11 @@ public final class DreamBotJagexBulkImporter {
 
       for (int attempt = 1; attempt <= MAX_TEMPORARY_OAUTH_ATTEMPTS; attempt++) {
         control.checkpoint();
+        ProxyConfig proxy = activeProxy();
+        JagexOAuthClient oauth = new JagexOAuthClient(message -> log.accept(message), proxy);
         try (BrowserSession browser = launchBrowser(config.browserEngine, config.browserPath, config.jcefDir,
-            config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(), config.userDataDir,
-              message -> log.accept("row " + account.index + " " + message))) {
+            config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(), config.userDataDir, proxy,
+            message -> log.accept("row " + account.index + " " + message))) {
           JagexCdpAutomation automation = new JagexCdpAutomation(browser, config.humanCheckWaitMs,
               message -> log.accept("row " + account.index + " " + message), control);
           automation.setImportMailCodeHelper(config.mailCodeHelper);
@@ -588,6 +580,10 @@ public final class DreamBotJagexBulkImporter {
           log.accept("row " + account.index + " added " + result.addedCount + " character(s)");
           record(account, "added", "account store updated", result.addedCount, result.backup);
           return "added";
+        } catch (JagexCdpAutomation.RateLimitedException exception) {
+          handleRateLimit(account, exception);
+          attempt--;
+          continue;
         } catch (JagexCdpAutomation.TemporaryOAuthException exception) {
           if (attempt >= MAX_TEMPORARY_OAUTH_ATTEMPTS) {
             throw exception;
@@ -599,6 +595,38 @@ public final class DreamBotJagexBulkImporter {
         }
       }
       throw new IllegalStateException("temporary Jagex OAuth retry loop ended unexpectedly");
+    }
+
+    private ProxyConfig activeProxy() {
+      return proxyIndex >= 0 && proxyIndex < proxies.size() ? proxies.get(proxyIndex) : ProxyConfig.none();
+    }
+
+    private void handleRateLimit(AccountRow account, JagexCdpAutomation.RateLimitedException exception) {
+      if (rotateProxy()) {
+        log.accept("row " + account.index + " Jagex rate limited the current proxy; switching to next proxy "
+            + (proxyIndex + 1) + "/" + proxies.size());
+        return;
+      }
+      long cooldownMs = Math.max(60_000L, config.rateLimitCooldownMs);
+      String subject = proxies.isEmpty()
+          ? "the current connection"
+          : (proxies.size() == 1 ? "the current proxy" : "all configured proxies");
+      log.accept("row " + account.index + " Jagex rate limited " + subject + "; cooling down for "
+          + formatDuration(cooldownMs) + " before retrying");
+      log.accept("row " + account.index + " rate-limit detail: " + shortReason(exception.getMessage()));
+      control.sleep(cooldownMs);
+    }
+
+    private boolean rotateProxy() {
+      if (proxies.size() <= 1) {
+        return false;
+      }
+      if (proxyIndex + 1 >= proxies.size()) {
+        proxyIndex = 0;
+        return false;
+      }
+      proxyIndex++;
+      return true;
     }
 
     private DreamBotAccountStore.AddResult verifyStoreResult(DreamBotAccountStore.AddResult result,
@@ -625,17 +653,22 @@ public final class DreamBotJagexBulkImporter {
     }
 
     private String browserSummary(Config config) {
-      String visibility = config.isHeadless() && config.browserEngine == BrowserEngine.JCEF
-          ? "minimized/internal"
-          : (config.isHeadless() ? "headless" : "visible");
-      if (config.browserEngine == BrowserEngine.JCEF) {
-        Path jcefDir = config.jcefDir == null ? JcefBrowserLauncher.defaultInstallDir() : config.jcefDir;
-        return "Browser: embedded JCEF (" + visibility + "), runtime cache " + jcefDir.toAbsolutePath();
+      String visibility = config.isHeadless()
+          ? ("system".equalsIgnoreCase(config.browserEngine) ? "headless" : "minimized/internal")
+          : "visible";
+      if ("system".equalsIgnoreCase(config.browserEngine)) {
+        String browser = config.browserPath == null || config.browserPath.isBlank()
+            ? "auto-located Chrome/Chromium/Edge"
+            : config.browserPath;
+        return "Browser: " + browser + " (" + visibility + ")" + proxySummary();
       }
-      String browser = config.browserPath == null || config.browserPath.isBlank()
-          ? "auto-located Chrome/Chromium/Edge"
-          : config.browserPath;
-      return "Browser: " + browser + " (" + visibility + ")";
+      Path jcefDir = config.jcefDir == null ? JcefBrowserLauncher.defaultInstallDir() : config.jcefDir;
+      return "Browser: embedded JCEF (" + visibility + "), runtime cache " + jcefDir.toAbsolutePath()
+          + proxySummary();
+    }
+
+    private String proxySummary() {
+      return proxies.isEmpty() ? "" : ", starting on proxy 1/" + proxies.size();
     }
 
     private void sleepBeforeRetry(int attempt) {
@@ -648,6 +681,19 @@ public final class DreamBotJagexBulkImporter {
         return reason.substring(0, 220) + "...";
       }
       return reason.isEmpty() ? "no detail" : reason;
+    }
+
+    private String formatDuration(long millis) {
+      long totalMinutes = Math.max(1L, TimeUnit.MILLISECONDS.toMinutes(millis));
+      long hours = totalMinutes / 60L;
+      long minutes = totalMinutes % 60L;
+      if (hours == 0L) {
+        return totalMinutes + "m";
+      }
+      if (minutes == 0L) {
+        return hours + "h";
+      }
+      return hours + "h " + minutes + "m";
     }
 
     private List<AccountRow> readRowsFromStdin() throws IOException {
@@ -772,7 +818,7 @@ public final class DreamBotJagexBulkImporter {
     boolean stdin;
     int start = 1;
     int end = -1;
-    BrowserEngine browserEngine = BrowserEngine.JCEF;
+    String browserEngine = "jcef";
     String browserPath = "";
     Path userDataDir;
     Path jcefDir;
@@ -783,14 +829,16 @@ public final class DreamBotJagexBulkImporter {
     boolean allowDreamBotRunning;
     String mailCodeHelper = "";
     Boolean headless;
+    List<ProxyConfig> proxies = new ArrayList<>(ProxyConfig.listFromEnv());
+    long rateLimitCooldownMs = DEFAULT_RATE_LIMIT_COOLDOWN_MS;
 
     boolean isHeadless() {
-      return headless == null ? browserEngine == BrowserEngine.JCEF : headless;
+      return headless == null ? !"system".equalsIgnoreCase(browserEngine) : headless;
     }
 
     static Config parse(List<String> argv) {
       Config config = new Config();
-      boolean engineExplicit = false;
+      Path proxyFile = null;
       for (int i = 0; i < argv.size(); i++) {
         String arg = argv.get(i);
         switch (arg) {
@@ -813,17 +861,19 @@ public final class DreamBotJagexBulkImporter {
             config.end = Integer.parseInt(requireValue(argv, ++i, arg));
             break;
           case "--browser-engine":
-            config.browserEngine = BrowserEngine.parse(requireValue(argv, ++i, arg));
-            engineExplicit = true;
+            config.browserEngine = requireValue(argv, ++i, arg);
             break;
           case "--browser":
             config.browserPath = requireValue(argv, ++i, arg);
-            if (!engineExplicit) {
-              config.browserEngine = BrowserEngine.SYSTEM;
-            }
             break;
           case "--user-data-dir":
             config.userDataDir = Paths.get(requireValue(argv, ++i, arg));
+            break;
+          case "--system-browser":
+            config.browserEngine = "system";
+            break;
+          case "--embedded-browser":
+            config.browserEngine = "jcef";
             break;
           case "--jcef-dir":
             config.jcefDir = Paths.get(requireValue(argv, ++i, arg));
@@ -833,6 +883,13 @@ public final class DreamBotJagexBulkImporter {
             break;
           case "--human-check-wait-ms":
             config.humanCheckWaitMs = Long.parseLong(requireValue(argv, ++i, arg));
+            break;
+          case "--rate-limit-cooldown-minutes":
+            config.rateLimitCooldownMs = TimeUnit.MINUTES.toMillis(
+                Math.max(1L, Long.parseLong(requireValue(argv, ++i, arg))));
+            break;
+          case "--proxy-file":
+            proxyFile = Paths.get(requireValue(argv, ++i, arg));
             break;
           case "--mail-code-helper":
             config.mailCodeHelper = requireValue(argv, ++i, arg);
@@ -854,6 +911,13 @@ public final class DreamBotJagexBulkImporter {
             break;
           default:
             throw new IllegalArgumentException("unknown option: " + arg);
+        }
+      }
+      if (proxyFile != null) {
+        try {
+          config.proxies = readProxyFile(proxyFile);
+        } catch (IOException exception) {
+          throw new IllegalArgumentException("could not read proxy file: " + proxyFile);
         }
       }
       if (!config.stdin && config.input == null) {
@@ -965,8 +1029,8 @@ public final class DreamBotJagexBulkImporter {
   private static final class Gui {
     private final JTextField input = new JTextField();
     private final JTextField db = new JTextField();
+    private final JTextField proxyFile = new JTextField();
     private final JButton viewDb = new JButton("View DB");
-    private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
@@ -985,9 +1049,7 @@ public final class DreamBotJagexBulkImporter {
       JPanel form = new JPanel(new GridBagLayout());
       addRow(form, 0, "Accounts file", input, chooserButton(input, false));
       addDbRow(form, 1);
-      addRow(form, 2, "Browser engine", engine);
-      engine.addActionListener(event -> updateEngineFields());
-      updateEngineFields();
+      addRow(form, 2, "Proxy file", proxyFile, chooserButton(proxyFile, false));
       autoDetectDbOnce();
       viewDb.addActionListener(event -> showSelectedAccountsDb());
 
@@ -1062,24 +1124,6 @@ public final class DreamBotJagexBulkImporter {
       addRow(panel, y, "accounts.db", db, actions);
     }
 
-    private void addRow(JPanel panel, int y, String label, JComboBox<String> comboBox) {
-      GridBagConstraints c = new GridBagConstraints();
-      c.gridy = y;
-      c.insets = new Insets(4, 6, 4, 6);
-      c.anchor = GridBagConstraints.WEST;
-      panel.add(new JLabel(label), c);
-      c.gridx = 1;
-      c.gridwidth = 2;
-      c.weightx = 1;
-      c.fill = GridBagConstraints.HORIZONTAL;
-      panel.add(comboBox, c);
-    }
-
-    private void updateEngineFields() {
-      boolean embedded = engine.getSelectedIndex() == 0;
-      headless.setText(embedded ? "Minimized/internal browser" : "Headless system browser");
-    }
-
     private void autoDetectDbOnce() {
       if (!db.getText().trim().isEmpty()) {
         return;
@@ -1116,8 +1160,18 @@ public final class DreamBotJagexBulkImporter {
       Config config = new Config();
       config.input = input.getText().trim().isEmpty() ? null : Paths.get(input.getText().trim());
       config.db = db.getText().trim().isEmpty() ? null : Paths.get(db.getText().trim());
-      config.browserEngine = engine.getSelectedIndex() == 0 ? BrowserEngine.JCEF : BrowserEngine.SYSTEM;
       config.headless = headless.isSelected();
+      if (proxyFile.getText().trim().isEmpty()) {
+        config.proxies = List.of();
+      } else {
+        try {
+          config.proxies = readProxyFile(Paths.get(proxyFile.getText().trim()));
+        } catch (IOException exception) {
+          status.setText("Could not read proxy file");
+          appendLog("Could not read proxy file: " + sanitizeDiagnostic(exception.getMessage()));
+          return;
+        }
+      }
 
       GuiRunControl control = new GuiRunControl();
       runControl = control;
@@ -1598,6 +1652,24 @@ public final class DreamBotJagexBulkImporter {
       }
     }
     return options;
+  }
+
+  private static List<ProxyConfig> proxyListFromOptions(Map<String, String> options) throws IOException {
+    if (options.containsKey("proxy-file")) {
+      return readProxyFile(Paths.get(options.get("proxy-file")));
+    }
+    return ProxyConfig.listFromEnv();
+  }
+
+  private static List<ProxyConfig> readProxyFile(Path file) throws IOException {
+    if (!Files.isRegularFile(file)) {
+      throw new IllegalArgumentException("proxy file does not exist: " + file);
+    }
+    return ProxyConfig.parseList(Files.readString(file, StandardCharsets.UTF_8));
+  }
+
+  private static ProxyConfig firstProxy(List<ProxyConfig> proxies) {
+    return proxies == null || proxies.isEmpty() ? ProxyConfig.none() : proxies.get(0);
   }
 
   private static boolean isTruthy(String value) {

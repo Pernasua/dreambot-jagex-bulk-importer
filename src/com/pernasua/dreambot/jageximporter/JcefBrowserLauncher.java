@@ -26,6 +26,7 @@ import org.cef.CefClient;
 import org.cef.CefSettings;
 import org.cef.browser.CefBrowser;
 import org.cef.browser.CefFrame;
+import org.cef.callback.CefAuthCallback;
 import org.cef.handler.CefRequestHandlerAdapter;
 import org.cef.handler.CefResourceRequestHandler;
 import org.cef.handler.CefResourceRequestHandlerAdapter;
@@ -38,24 +39,26 @@ final class JcefBrowserLauncher {
   private static CefApp app;
   private static Path activeInstallDir;
   private static int activePort;
+  private static String activeProxySignature = "";
 
   private JcefBrowserLauncher() {
   }
 
   static BrowserSession launch(Path installDir, int requestedPort, boolean keepOpen, boolean headless,
-      Consumer<String> log) throws Exception {
+      Consumer<String> log, ProxyConfig proxy) throws Exception {
     Consumer<String> safeLog = DiagnosticSanitizer.consumer(log);
     requireDisplayIfLinux();
-    int port = ensureApp(installDir, requestedPort, safeLog);
+    ProxyConfig effectiveProxy = proxy == null ? ProxyConfig.fromEnv() : proxy;
+    int port = ensureApp(installDir, requestedPort, safeLog, effectiveProxy);
     CefClient client = app.createClient();
     ReferrerRegistry referrers = new ReferrerRegistry();
-    client.addRequestHandler(new ReferrerRequestHandler(referrers, safeLog));
+    client.addRequestHandler(new ReferrerRequestHandler(referrers, safeLog, effectiveProxy));
     CefBrowser browser = client.createBrowser("about:blank", false, false);
     JFrame frame = showBrowserWindow(browser, !headless);
 
     String endpoint = "http://127.0.0.1:" + port;
     waitForDevTools(endpoint);
-    return new BrowserSession(BrowserEngine.JCEF, endpoint, port, headless, keepOpen,
+    return new BrowserSession("jcef", endpoint, port, headless, keepOpen,
         () -> closeBrowser(browser, client, frame, keepOpen),
         () -> revealBrowser(frame),
         () -> hideBrowser(frame),
@@ -76,11 +79,18 @@ final class JcefBrowserLauncher {
     return parent.resolve("profile");
   }
 
-  private static int ensureApp(Path requestedInstallDir, int requestedPort, Consumer<String> log) throws Exception {
+  private static int ensureApp(Path requestedInstallDir, int requestedPort, Consumer<String> log,
+      ProxyConfig proxy) throws Exception {
     synchronized (INIT_LOCK) {
       Path installDir = (requestedInstallDir == null ? defaultInstallDir() : requestedInstallDir)
           .toAbsolutePath().normalize();
       int port = requestedPort > 0 ? requestedPort : (activePort > 0 ? activePort : Ports.freePort());
+      String proxySignature = proxy == null ? "" : proxy.signature();
+      if (app != null) {
+        if (!Objects.equals(proxySignature, activeProxySignature)) {
+          disposeApp();
+        }
+      }
       if (app != null) {
         if (!Objects.equals(activeInstallDir, installDir)) {
           throw new IllegalStateException("embedded JCEF is already initialized with " + activeInstallDir);
@@ -99,6 +109,14 @@ final class JcefBrowserLauncher {
           "--remote-debugging-address=127.0.0.1",
           "--remote-allow-origins=*",
           "--window-size=1280,900");
+      if (proxy != null && proxy.enabled()) {
+        builder.addJcefArgs(
+            "--proxy-server=" + proxy.chromiumProxyArg(),
+            "--proxy-bypass-list=<-loopback>");
+        if (!proxy.isSocks()) {
+          builder.addJcefArgs("--disable-quic");
+        }
+      }
       if (isLinux()) {
         builder.addJcefArgs("--no-sandbox");
       }
@@ -115,6 +133,7 @@ final class JcefBrowserLauncher {
       app = builder.build();
       activeInstallDir = installDir;
       activePort = port;
+      activeProxySignature = proxySignature;
       return activePort;
     }
   }
@@ -168,6 +187,25 @@ final class JcefBrowserLauncher {
       if (frame != null) {
         SwingUtilities.invokeAndWait(frame::dispose);
       }
+      synchronized (INIT_LOCK) {
+        disposeApp();
+      }
+    }
+  }
+
+  private static void disposeApp() {
+    if (app == null) {
+      return;
+    }
+    try {
+      app.dispose();
+    } catch (Exception ignored) {
+      // Best effort.
+    } finally {
+      app = null;
+      activeInstallDir = null;
+      activePort = 0;
+      activeProxySignature = "";
     }
   }
 
@@ -345,10 +383,23 @@ final class JcefBrowserLauncher {
   private static final class ReferrerRequestHandler extends CefRequestHandlerAdapter {
     private final ReferrerRegistry referrers;
     private final Consumer<String> log;
+    private final ProxyConfig proxy;
 
-    ReferrerRequestHandler(ReferrerRegistry referrers, Consumer<String> log) {
+    ReferrerRequestHandler(ReferrerRegistry referrers, Consumer<String> log, ProxyConfig proxy) {
       this.referrers = referrers;
       this.log = log == null ? ignored -> { } : log;
+      this.proxy = proxy == null ? ProxyConfig.none() : proxy;
+    }
+
+    @Override
+    public boolean getAuthCredentials(CefBrowser browser, String originUrl, boolean isProxy,
+        String host, int port, String realm, String scheme, CefAuthCallback callback) {
+      if (isProxy && proxy.hasCredentials()) {
+        callback.Continue(proxy.username(), proxy.password());
+        log.accept("embedded JCEF supplied proxy credentials");
+        return true;
+      }
+      return false;
     }
 
     @Override

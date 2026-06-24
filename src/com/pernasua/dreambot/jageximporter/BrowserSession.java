@@ -4,7 +4,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 final class BrowserSession implements AutoCloseable {
-  final BrowserEngine engine;
+  final String engine;
   final String endpoint;
   final int port;
   final boolean headless;
@@ -18,35 +18,11 @@ final class BrowserSession implements AutoCloseable {
   private final NativeClickAction nativeClickAction;
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
-  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
-      boolean keepOpen, AutoCloseable closeAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, null, null, null, null, null);
-  }
-
-  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
-      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, null, null, null, null);
-  }
-
-  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
-      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
-      Consumer<JagexOAuthClient.AuthRequest> authRequestAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction,
-        authRequestAction, null, null);
-  }
-
-  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
-      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
-      Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction,
-        authRequestAction, navigateAction, null);
-  }
-
-  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
-      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
+  BrowserSession(String engine, String endpoint, int port, boolean headless, boolean keepOpen,
+      AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
       Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction,
       NativeClickAction nativeClickAction) {
-    this.engine = engine;
+    this.engine = String.valueOf(engine == null ? "" : engine).trim().toLowerCase(java.util.Locale.ROOT);
     this.endpoint = endpoint;
     this.port = port;
     this.headless = headless;

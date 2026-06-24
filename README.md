@@ -35,6 +35,25 @@ email:password:totp-secret
 Passwords may contain `:`. The parser uses the first separator for the email
 and the last separator for the TOTP secret.
 
+## Proxy
+
+In the GUI, set the optional `Proxy file` field to a text file containing one
+proxy per line as `server|username|password`. `server` alone is also valid.
+When multiple lines are present, the importer starts on the first proxy and
+only advances to the next one after a rate-limit event.
+
+CLI runs can use:
+
+```bash
+java -jar dist/dreambot-jagex-bulk-importer.jar \
+  --input accounts.txt \
+  --db /path/to/accounts.db \
+  --proxy-file proxies.txt
+```
+
+The existing `CLOAK_PROXY_SERVER`, `CLOAK_PROXY_USER`, and `CLOAK_PROXY_PASS`
+environment variables are still used when no proxy is set in the GUI or CLI.
+
 ## CLI Reference
 
 ### Main Modes
@@ -47,7 +66,7 @@ and the last separator for the TOTP secret.
 | `--stdin [--db PATH]` | Import rows from standard input. |
 | `--db-info PATH` | Print JSON with account count, account-store codec label, and AAD. |
 | `--db-browser PATH` | Open a full table view of `accounts.db`. |
-| `--browser-check` | Launch the configured browser and report DevTools status. |
+| `--browser-check` | Launch embedded JCEF and report DevTools status. |
 | `--page-state --devtools-port N` | Print JSON describing the current browser page. |
 | `--totp SECRET` | Print the current TOTP code for a base32 secret. |
 | `--enroll-only` | Enroll authenticator secrets and print `email:password:secret` rows. |
@@ -65,14 +84,13 @@ These flags apply to `--input ...` and `--stdin` import runs.
 | `--start N` | First 1-based source row to import. Default: `1`. |
 | `--end N` | Last 1-based source row to import. Default: last row. |
 | `--ledger PATH` | Non-secret JSONL result ledger. Default: next to `accounts.db`. |
-| `--browser-engine jcef\|system` | Browser engine. Default: `jcef`. |
-| `--browser PATH` | Chrome, Chromium, or Edge executable for `system` browser mode. |
-| `--user-data-dir PATH` | Reuse a system browser profile directory. |
 | `--jcef-dir PATH` | Embedded JCEF runtime cache directory. |
-| `--headless` | Run the selected browser headless/minimized. |
-| `--headed` | Show the selected browser window. |
+| `--headless` | Start embedded JCEF minimized/internal. |
+| `--headed` | Show the embedded JCEF browser window. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
+| `--proxy-file PATH` | Proxy list file. One proxy per line as `server|username|password`. |
+| `--rate-limit-cooldown-minutes N` | Wait before retrying after a Jagex rate-limit page. Default: `180`. |
 | `--keep-browser-open` | Leave the browser open after import attempts. |
 | `--allow-dreambot-running` | Bypass the DreamBot process guard for isolated DB copies. |
 | `--dry-run` | Parse rows, validate TOTP secrets, and decrypt DB without importing. |
@@ -86,12 +104,11 @@ java -jar dist/dreambot-jagex-bulk-importer.jar --browser-check [flags]
 
 | Flag | Description |
 | --- | --- |
-| `--browser-engine jcef\|system` | Browser engine. Default: `jcef`, or `system` when `--browser` is set. |
-| `--browser PATH` | Chrome, Chromium, or Edge executable. |
 | `--jcef-dir PATH` | Embedded JCEF runtime cache directory. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
-| `--headless` | Force headless/minimized browser mode. |
-| `--headed` | Force visible browser mode. |
+| `--headless` | Start embedded JCEF minimized/internal. |
+| `--headed` | Show the embedded JCEF browser window. |
+| `--proxy-file PATH` | Proxy list file. |
 
 ### Page State Flags
 
@@ -114,16 +131,14 @@ java -jar dist/dreambot-jagex-bulk-importer.jar --enroll-only --account email:pa
 | --- | --- |
 | `--input PATH` | File containing `email:password` rows. Required unless `--account` is used. |
 | `--account email:password` | Single account to enroll. |
-| `--browser-engine jcef\|system` | Browser engine. Default: `jcef`. |
-| `--browser PATH` | Chrome, Chromium, or Edge executable for `system` browser mode. |
-| `--user-data-dir PATH` | Reuse a system browser profile directory. |
 | `--jcef-dir PATH` | Embedded JCEF runtime cache directory. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
-| `--headless` | Force headless/minimized browser mode. |
-| `--headed` | Force visible browser mode. |
+| `--headless` | Start embedded JCEF minimized/internal. |
+| `--headed` | Show the embedded JCEF browser window. |
 | `--ledger PATH` | Optional non-secret JSONL enrollment ledger. |
 | `--mail-code-helper PATH` | Helper command used to read email verification codes. |
+| `--proxy-file PATH` | Proxy list file. |
 
 ### Disable-Email-Only Flags
 
@@ -136,15 +151,13 @@ java -jar dist/dreambot-jagex-bulk-importer.jar \
 | Flag | Description |
 | --- | --- |
 | `--account email:password:secret` | Account and authenticator secret. Required. |
-| `--browser-engine jcef\|system` | Browser engine. Default: `jcef`. |
-| `--browser PATH` | Chrome, Chromium, or Edge executable for `system` browser mode. |
-| `--user-data-dir PATH` | Reuse a system browser profile directory. |
 | `--jcef-dir PATH` | Embedded JCEF runtime cache directory. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
-| `--headless` | Force headless/minimized browser mode. |
-| `--headed` | Force visible browser mode. |
+| `--headless` | Start embedded JCEF minimized/internal. |
+| `--headed` | Show the embedded JCEF browser window. |
 | `--mail-code-helper PATH` | Helper command used to read email verification codes. |
+| `--proxy-file PATH` | Proxy list file. |
 
 ## GUI
 
@@ -174,7 +187,6 @@ When a run finishes, the GUI opens the ledger file.
   - Linux/macOS: `$XDG_CACHE_HOME/dreambot-jagex-bulk-importer/jcef` or
     `~/.cache/dreambot-jagex-bulk-importer/jcef`
 - Linux embedded JCEF needs a display server. Use a desktop session or `xvfb-run`.
-- `--browser-engine system` uses installed Chrome, Chromium, or Edge.
 - The ledger is a JSONL audit file for row results. DreamBot does not read it.
 - The ledger does not include account identifiers, passwords, TOTP secrets, OTP
   values, or OAuth tokens. Use row indexes to map results back to the input file.
@@ -182,8 +194,8 @@ When a run finishes, the GUI opens the ledger file.
   `accounts.db`.
 - Wrong passwords and rejected authenticator codes are skipped with explicit ledger
   statuses: `invalid_credentials`, `invalid_otp_code`, or `account_locked`.
-- Human-check handling logs detection reason, click attempts, screenshot paths,
-  and timeout details so Cloudflare/Jagex challenge failures are diagnosable.
+- Human-check handling logs detection reason, click attempts, failure screenshot
+  paths, and timeout details so Cloudflare/Jagex challenge failures are diagnosable.
 
 If `--db-info` reports that no scanned AAD value can decrypt the file, close
 DreamBot and copy `BotData/accounts.db` again. If DreamBot can still read the

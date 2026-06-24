@@ -50,11 +50,15 @@ final class JagexOAuthClient {
   }
 
   JagexOAuthClient(java.util.function.Consumer<String> log) {
+    this(log, ProxyConfig.fromEnv());
+  }
+
+  JagexOAuthClient(java.util.function.Consumer<String> log, ProxyConfig proxy) {
     this.log = DiagnosticSanitizer.consumer(log);
     HttpClient.Builder builder = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(20))
         .followRedirects(HttpClient.Redirect.NEVER);
-    configureProxy(builder);
+    configureProxy(builder, proxy == null ? ProxyConfig.fromEnv() : proxy);
     this.http = builder.build();
   }
 
@@ -398,47 +402,45 @@ final class JagexOAuthClient {
     return text;
   }
 
-  private void configureProxy(HttpClient.Builder builder) {
-    String rawServer = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_SERVER", "")).trim();
-    if (rawServer.isEmpty()) {
+  private void configureProxy(HttpClient.Builder builder, ProxyConfig proxy) {
+    if (proxy == null || !proxy.enabled()) {
       return;
     }
-    String rawUser = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_USER", "")).trim();
-    String rawPass = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_PASS", "")).trim();
     try {
-      URI uri = URI.create(rawServer);
+      URI uri = proxy.uri();
       String scheme = String.valueOf(uri.getScheme() == null ? "" : uri.getScheme()).toLowerCase(Locale.ROOT);
       String host = uri.getHost();
       int port = uri.getPort();
       if (host == null || host.isBlank() || port <= 0) {
-        log.accept("game-session proxy ignored; could not parse " + rawServer);
+        log.accept("game-session proxy ignored; could not parse configured proxy");
         return;
       }
       if (scheme.startsWith("socks")) {
         System.setProperty("socksProxyHost", host);
         System.setProperty("socksProxyPort", String.valueOf(port));
-        if (!rawUser.isEmpty()) {
-          System.setProperty("java.net.socks.username", rawUser);
+        if (proxy.hasCredentials()) {
+          System.setProperty("java.net.socks.username", proxy.username());
         }
-        if (!rawPass.isEmpty()) {
-          System.setProperty("java.net.socks.password", rawPass);
+        if (!proxy.password().isEmpty()) {
+          System.setProperty("java.net.socks.password", proxy.password());
         }
-        log.accept("game-session HTTP client using SOCKS proxy " + host + ":" + port);
+        log.accept("game-session HTTP client using configured SOCKS proxy");
         return;
       }
       builder.proxy(ProxySelector.of(new InetSocketAddress(host, port)));
-      if (!rawUser.isEmpty()) {
+      if (proxy.hasCredentials()) {
+        String proxyUser = proxy.username();
+        char[] proxyPassword = proxy.password().toCharArray();
         builder.authenticator(new java.net.Authenticator() {
           @Override
           protected java.net.PasswordAuthentication getPasswordAuthentication() {
-            return new java.net.PasswordAuthentication(rawUser, rawPass.toCharArray());
+            return new java.net.PasswordAuthentication(proxyUser, proxyPassword);
           }
         });
       }
-      log.accept("game-session HTTP client using proxy " + host + ":" + port);
+      log.accept("game-session HTTP client using configured proxy");
     } catch (Exception exception) {
-      log.accept("game-session proxy ignored; invalid CLOAK_PROXY_SERVER " + rawServer + " ("
-          + exception.getClass().getSimpleName() + ")");
+      log.accept("game-session proxy ignored; invalid configured proxy (" + exception.getClass().getSimpleName() + ")");
     }
   }
 

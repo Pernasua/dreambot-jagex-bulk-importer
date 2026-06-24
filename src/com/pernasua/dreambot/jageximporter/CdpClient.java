@@ -150,9 +150,62 @@ final class CdpClient implements AutoCloseable {
     params.put("userGesture", true);
     Map<String, Object> result = send("Runtime.evaluate", params);
     if (result.containsKey("exceptionDetails")) {
-      throw new IllegalStateException("CDP evaluation failed: " + Json.stringify(result.get("exceptionDetails")));
+      throw new IllegalStateException("CDP evaluation failed: "
+          + evaluationExceptionSummary(Json.asObject(result.get("exceptionDetails"))));
     }
     return Json.asObject(result.get("result")).get("value");
+  }
+
+  static String evaluationExceptionSummary(Map<String, Object> details) {
+    Map<String, Object> exception = Json.asObject(details.get("exception"));
+    String description = compact(Json.string(exception.get("description")));
+    String className = compact(Json.string(exception.get("className")));
+    String value = compact(Json.string(exception.get("value")));
+    String text = compact(Json.string(details.get("text")));
+    StringBuilder out = new StringBuilder();
+    if (!description.isEmpty()) {
+      out.append(description);
+    } else if (!className.isEmpty() || !value.isEmpty()) {
+      out.append(className.isEmpty() ? "exception" : className);
+      if (!value.isEmpty()) {
+        out.append(": ").append(value);
+      }
+    } else if (!text.isEmpty()) {
+      out.append(text);
+    } else {
+      out.append("unknown exception");
+    }
+    String line = compact(Json.string(details.get("lineNumber")));
+    String column = compact(Json.string(details.get("columnNumber")));
+    if (!line.isEmpty() || !column.isEmpty()) {
+      out.append(" at line ").append(line.isEmpty() ? "?" : line)
+          .append(" column ").append(column.isEmpty() ? "?" : column);
+    }
+    Map<String, Object> stackTrace = Json.asObject(details.get("stackTrace"));
+    List<Object> frames = Json.asList(stackTrace.get("callFrames"));
+    if (!frames.isEmpty()) {
+      Map<String, Object> frame = Json.asObject(frames.get(0));
+      String function = compact(Json.string(frame.get("functionName")));
+      String url = compact(Json.string(frame.get("url")));
+      if (!function.isEmpty() || !url.isEmpty()) {
+        out.append(" frame=");
+        if (!function.isEmpty()) {
+          out.append(function);
+        }
+        if (!url.isEmpty()) {
+          if (!function.isEmpty()) {
+            out.append("@");
+          }
+          out.append(url);
+        }
+      }
+    }
+    String summary = out.toString();
+    return summary.length() <= 420 ? summary : summary.substring(0, 420);
+  }
+
+  private static String compact(String text) {
+    return String.valueOf(text == null ? "" : text).replaceAll("\\s+", " ").trim();
   }
 
   void navigate(String url) {

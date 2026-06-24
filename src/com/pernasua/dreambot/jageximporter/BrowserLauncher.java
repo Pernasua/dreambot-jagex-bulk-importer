@@ -2,10 +2,9 @@ package com.pernasua.dreambot.jageximporter;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -14,15 +13,12 @@ import java.util.Locale;
 
 final class BrowserLauncher {
   private static final Duration STARTUP_TIMEOUT = Duration.ofSeconds(35);
+
   private BrowserLauncher() {
   }
 
-  static BrowserSession launch(String explicitBrowser, int requestedPort, boolean keepOpen, boolean headless) throws Exception {
-    return launch(explicitBrowser, requestedPort, keepOpen, headless, null);
-  }
-
   static BrowserSession launch(String explicitBrowser, int requestedPort, boolean keepOpen, boolean headless,
-      Path userDataDir) throws Exception {
+      Path userDataDir, ProxyConfig proxy) throws Exception {
     String browser = locateBrowser(explicitBrowser);
     int port = requestedPort > 0 ? requestedPort : Ports.freePort();
     Path profile = userDataDir == null
@@ -44,9 +40,6 @@ final class BrowserLauncher {
     String cloakTimezone = System.getenv("CLOAK_TZ");
     String cloakLocale = System.getenv("CLOAK_LOCALE");
     String cloakExitIp = System.getenv("CLOAK_EXIT_IP");
-    String cloakProxyServer = System.getenv("CLOAK_PROXY_SERVER");
-    String cloakProxyUser = System.getenv("CLOAK_PROXY_USER");
-    String cloakProxyPass = System.getenv("CLOAK_PROXY_PASS");
     if (cloakSeed != null && !cloakSeed.isBlank()) {
       command.add("--disable-blink-features=AutomationControlled");
       command.add("--enable-features=BarcodeDetector");
@@ -64,10 +57,11 @@ final class BrowserLauncher {
     if (cloakExitIp != null && !cloakExitIp.isBlank()) {
       command.add("--fingerprint-webrtc-ip=" + cloakExitIp.trim());
     }
-    String proxyArg = chromiumProxyArg(cloakProxyServer, cloakProxyUser, cloakProxyPass);
+    ProxyConfig effectiveProxy = proxy == null ? ProxyConfig.fromEnv() : proxy;
+    String proxyArg = effectiveProxy.enabled() ? effectiveProxy.chromiumProxyArg() : "";
     if (!proxyArg.isEmpty()) {
       command.add("--proxy-server=" + proxyArg);
-      if (!proxyArg.toLowerCase(Locale.ROOT).startsWith("socks")) {
+      if (!effectiveProxy.isSocks()) {
         command.add("--disable-quic");
       }
       command.add("--proxy-bypass-list=<-loopback>");
@@ -97,8 +91,9 @@ final class BrowserLauncher {
       }
       try {
         if (!CdpClient.targets(endpoint).isEmpty()) {
-          return new BrowserSession(BrowserEngine.SYSTEM, endpoint, port, headless, keepOpen,
-              () -> close(process, profile, keepOpen, userDataDir == null));
+          return new BrowserSession("system", endpoint, port, headless, keepOpen,
+              () -> close(process, profile, keepOpen, userDataDir == null),
+              null, null, null, null, null);
         }
       } catch (IOException ignored) {
         // Browser is still starting.
@@ -176,31 +171,6 @@ final class BrowserLauncher {
     } catch (Exception ignored) {
       return false;
     }
-  }
-
-  private static String chromiumProxyArg(String server, String username, String password) {
-    String rawServer = server == null ? "" : server.trim();
-    if (rawServer.isEmpty()) {
-      return "";
-    }
-    String lower = rawServer.toLowerCase(Locale.ROOT);
-    boolean isSocks = lower.startsWith("socks5://") || lower.startsWith("socks5h://");
-    if (isSocks && !rawServer.contains("@") && ((username != null && !username.isBlank())
-        || (password != null && !password.isBlank()))) {
-      int schemeSplit = rawServer.indexOf("://");
-      if (schemeSplit > 0) {
-        String scheme = rawServer.substring(0, schemeSplit);
-        String host = rawServer.substring(schemeSplit + 3);
-        String encUser = urlEncode(username == null ? "" : username.trim());
-        String encPass = urlEncode(password == null ? "" : password.trim());
-        return scheme + "://" + encUser + ":" + encPass + "@" + host;
-      }
-    }
-    return rawServer;
-  }
-
-  private static String urlEncode(String value) {
-    return URLEncoder.encode(value, StandardCharsets.UTF_8);
   }
 
   private static String shellQuote(String value) {
