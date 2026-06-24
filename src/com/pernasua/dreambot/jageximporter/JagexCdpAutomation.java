@@ -18,6 +18,7 @@ final class JagexCdpAutomation {
   private final RunControl control;
   private String importMailCodeHelper = "";
   private String lastHumanCheckDetail = "";
+  private int nativeHumanCheckPointCursor = 0;
   private final String screenshotDir = System.getenv().getOrDefault("DREAMBOT_JAGEX_IMPORTER_SHOT_DIR",
       "/tmp/enroll-shots");
 
@@ -35,7 +36,7 @@ final class JagexCdpAutomation {
       RunControl control) {
     this.browser = browser;
     this.humanCheckWaitMs = Math.max(0, humanCheckWaitMs);
-    this.log = log == null ? ignored -> { } : log;
+    this.log = DiagnosticSanitizer.consumer(log);
     this.control = control == null ? RunControl.NONE : control;
   }
 
@@ -744,8 +745,7 @@ final class JagexCdpAutomation {
           if (onSetupPage) {
             if (!state.href.equals(lastDumpHref)) {
               lastDumpHref = state.href;
-              log.accept("ENROLL-SETUP-DUMP @ " + brief(state.href) + " <<<"
-                  + (enrollText.length() > 2200 ? enrollText.substring(0, 2200) : enrollText) + ">>>");
+              log.accept("authenticator setup page detected @ " + brief(state.href));
             }
             secret = extractSecretFromText(enrollText);
             if (!secret.isEmpty()) {
@@ -1410,11 +1410,9 @@ final class JagexCdpAutomation {
     }
     String combined = (state.text + " " + deep).toLowerCase(Locale.ROOT);
     String textReason = firstHumanCheckTextReason(combined);
-    if (!textReason.isEmpty()) {
-      return new HumanCheckProbe(true, humanProbeDetail(state, "text:" + textReason, "", "", errors));
-    }
 
     String targetInfo = "";
+    boolean hasTargetFrame = false;
     try {
       int matchingTargets = 0;
       String first = "";
@@ -1430,38 +1428,53 @@ final class JagexCdpAutomation {
       }
       if (matchingTargets > 0) {
         targetInfo = " target_iframe_matches=" + matchingTargets + " first_target=" + first;
-        return new HumanCheckProbe(true, humanProbeDetail(state, "target-iframe", targetInfo, "", errors));
+        hasTargetFrame = true;
+      } else {
+        targetInfo = " target_iframe_matches=0";
       }
-      targetInfo = " target_iframe_matches=0";
     } catch (Exception exception) {
       targetInfo = " target_probe_error=" + brief(exception.getMessage());
     }
 
     String domInfo = "";
+    boolean hasDomFrame = false;
     try {
       Map<String, Object> domChallenge = Json.asObject(cdp.evaluate("(() => {"
           + "const visible=(el)=>{if(!el)return false;const s=getComputedStyle(el);"
           + "if(s.visibility==='hidden'||s.display==='none')return false;"
           + "const r=el.getBoundingClientRect();return r.width>0&&r.height>0;};"
-          + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe)=>{"
+          + "const allFrames=Array.from(document.querySelectorAll('iframe'));"
+          + "const frames=allFrames.filter(visible).map((iframe)=>{"
           + "const r=iframe.getBoundingClientRect();"
           + "return {title:String(iframe.title||''),name:String(iframe.name||''),id:String(iframe.id||''),"
           + "src:String(iframe.src||''),aria:String(iframe.getAttribute('aria-label')||''),"
-          + "w:Math.round(r.width),h:Math.round(r.height)};});"
+          + "x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)};});"
           + "const matches=frames.filter((frame)=>/cloudflare|challenge|turnstile|captcha|human|verify/i"
           + ".test([frame.title,frame.name,frame.id,frame.src,frame.aria].join(' ')));"
-          + "return {visible:frames.length,matches:matches.length,first:matches[0]||null};"
+          + "return {total:allFrames.length,visible:frames.length,matches:matches.length,"
+          + "first:matches[0]||frames[0]||null};"
           + "})()"));
+      int total = Json.number(domChallenge.get("total")).intValue();
       int visible = Json.number(domChallenge.get("visible")).intValue();
       int matches = Json.number(domChallenge.get("matches")).intValue();
-      domInfo = " dom_iframes=" + visible + " dom_matches=" + matches;
-      if (matches > 0) {
+      domInfo = " dom_iframes=" + visible + "/" + total + " dom_matches=" + matches;
+      if (matches > 0 || visible > 0) {
         String first = brief(Json.stringify(domChallenge.get("first")));
         domInfo += " first_dom_iframe=" + first;
-        return new HumanCheckProbe(true, humanProbeDetail(state, "dom-iframe", targetInfo, domInfo, errors));
+        hasDomFrame = true;
       }
     } catch (RuntimeException exception) {
       domInfo = " dom_probe_error=" + brief(exception.getMessage());
+    }
+    if (!textReason.isEmpty()) {
+      return new HumanCheckProbe(true,
+          humanProbeDetail(state, "text:" + textReason, targetInfo, domInfo, errors));
+    }
+    if (hasTargetFrame) {
+      return new HumanCheckProbe(true, humanProbeDetail(state, "target-iframe", targetInfo, domInfo, errors));
+    }
+    if (hasDomFrame) {
+      return new HumanCheckProbe(true, humanProbeDetail(state, "dom-iframe", targetInfo, domInfo, errors));
     }
     return new HumanCheckProbe(false, humanProbeDetail(state, "none", targetInfo, domInfo, errors));
   }
@@ -1869,11 +1882,14 @@ final class JagexCdpAutomation {
       return "main " + clicked;
     }
     try {
+      ArrayList<CdpClient.Target> genericIframeTargets = new ArrayList<>();
       for (CdpClient.Target target : CdpClient.targets(browser.endpoint)) {
         String targetText = (target.type + " " + target.title + " " + target.url).toLowerCase(Locale.ROOT);
-        if (!"iframe".equalsIgnoreCase(target.type)
-            || target.webSocketUrl.isEmpty()
-            || !matches(targetText, "cloudflare|challenge|turnstile|captcha|human|verify")) {
+        if (!"iframe".equalsIgnoreCase(target.type) || target.webSocketUrl.isEmpty()) {
+          continue;
+        }
+        if (!matches(targetText, "cloudflare|challenge|turnstile|captcha|human|verify")) {
+          genericIframeTargets.add(target);
           continue;
         }
         try (CdpClient frame = CdpClient.connect(target.webSocketUrl)) {
@@ -1891,21 +1907,121 @@ final class JagexCdpAutomation {
           log.accept("could not click human-check iframe target: " + brief(exception.getMessage()));
         }
       }
+      clicked = clickGenericHumanCheckIframeTargets(genericIframeTargets);
+      if (!clicked.isEmpty()) {
+        return "iframe-target " + clicked;
+      }
     } catch (Exception exception) {
       log.accept("could not inspect human-check iframe targets: " + brief(exception.getMessage()));
     }
+    clicked = clickNativeHumanCheck(cdp);
+    if (!clicked.isEmpty()) {
+      return clicked;
+    }
     return "";
+  }
+
+  private String clickNativeHumanCheck(CdpClient cdp) {
+    if (browser.engine != BrowserEngine.JCEF) {
+      return "";
+    }
+    List<Object> points;
+    try {
+      points = Json.asList(cdp.evaluate("(() => {"
+          + visibleHelpers()
+          + "const points=[];"
+          + "const add=(x,y,label)=>{if(Number.isFinite(x)&&Number.isFinite(y))points.push({x,y,label});};"
+          + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe,index)=>{"
+          + "const r=iframe.getBoundingClientRect();"
+          + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ');"
+          + "const match=/cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined)?1:0;"
+          + "const central=1/(1+Math.abs((r.left+r.width/2)-(window.innerWidth||r.width)/2)"
+          + "+Math.abs((r.top+r.height/2)-(window.innerHeight||r.height)/2));"
+          + "const size=(r.width>=180&&r.width<=520&&r.height>=40&&r.height<=220)?1:0;"
+          + "return {iframe,index,match,score:match*10+size*3+central};"
+          + "}).sort((a,b)=>b.score-a.score||a.index-b.index);"
+          + "if(frames.length){"
+          + "const frame=frames[0];frame.iframe.scrollIntoView({block:'center',inline:'center'});"
+          + "const r=frame.iframe.getBoundingClientRect();"
+          + "const lx1=Math.max(16,Math.min(r.width-16,r.width*0.14));"
+          + "const lx2=Math.max(24,Math.min(r.width-16,r.width*0.22));"
+          + "add(r.left+lx1,r.top+r.height*0.52,'visible challenge frame native index='+frame.index+' match='+frame.match);"
+          + "add(r.left+lx2,r.top+r.height*0.52,'visible challenge frame native secondary index='+frame.index+' match='+frame.match);"
+          + "add(r.left+r.width/2,r.top+r.height/2,'visible challenge frame native center index='+frame.index+' match='+frame.match);"
+          + "}else{"
+          + "const w=window.innerWidth||document.documentElement.clientWidth||1280;"
+          + "const h=window.innerHeight||document.documentElement.clientHeight||900;"
+          + "add(w/2-120,h/2,'challenge panel native checkbox');"
+          + "add(w/2-85,h/2,'challenge panel native secondary');"
+          + "add(w/2,h/2,'challenge panel native center');"
+          + "add(w*0.18,h/2,'challenge page native body');"
+          + "}"
+          + "return points;"
+          + "})()"));
+    } catch (RuntimeException exception) {
+      log.accept("human-check native click point probe failed: " + brief(exception.getMessage()));
+      return "";
+    }
+    while (!points.isEmpty()) {
+      int index = Math.floorMod(nativeHumanCheckPointCursor++, points.size());
+      Map<String, Object> point = Json.asObject(points.get(index));
+      if (point.isEmpty()) {
+        points.remove(index);
+        continue;
+      }
+      String clicked = browser.nativeClick(
+          Json.number(point.get("x")).doubleValue(),
+          Json.number(point.get("y")).doubleValue(),
+          Json.string(point.get("label")));
+      return clicked.isEmpty() ? "" : "native " + clicked + " point=" + (index + 1) + "/" + points.size();
+    }
+    return "";
+  }
+
+  private String clickGenericHumanCheckIframeTargets(List<CdpClient.Target> targets) {
+    int attempted = 0;
+    String lastClick = "";
+    for (CdpClient.Target target : targets) {
+      if (attempted >= 4) {
+        break;
+      }
+      try (CdpClient frame = CdpClient.connect(target.webSocketUrl)) {
+        frame.send("Runtime.enable");
+        frame.send("Page.enable");
+        frame.send("Network.enable");
+        String clicked = clickHumanCheckProceedInContext(frame, false);
+        if (!clicked.isEmpty()) {
+          attempted++;
+          lastClick = clicked;
+        }
+      } catch (RuntimeException exception) {
+        log.accept("could not click generic human-check iframe target: " + brief(exception.getMessage()));
+      } catch (Exception exception) {
+        log.accept("could not connect generic human-check iframe target: " + brief(exception.getMessage()));
+      }
+    }
+    if (attempted == 0) {
+      return "";
+    }
+    return "generic iframe " + lastClick + " x" + attempted;
   }
 
   private String clickHumanCheckFrameByBounds(CdpClient cdp) {
     Map<String, Object> point = Json.asObject(cdp.evaluate("(() => {"
         + visibleHelpers()
-        + "const frame=Array.from(document.querySelectorAll('iframe')).filter(visible).find((iframe)=>{"
+        + "const frames=Array.from(document.querySelectorAll('iframe')).filter(visible).map((iframe,index)=>{"
+        + "const r=iframe.getBoundingClientRect();"
         + "const joined=[iframe.title,iframe.name,iframe.id,iframe.src,iframe.getAttribute('aria-label')].join(' ');"
-        + "return /cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined);});"
+        + "const match=/cloudflare|challenge|turnstile|captcha|human|verify/i.test(joined)?1:0;"
+        + "const central=1/(1+Math.abs((r.left+r.width/2)-(window.innerWidth||r.width)/2)"
+        + "+Math.abs((r.top+r.height/2)-(window.innerHeight||r.height)/2));"
+        + "const size=(r.width>=180&&r.width<=520&&r.height>=40&&r.height<=220)?1:0;"
+        + "return {iframe,index,match,score:match*10+size*3+central,x:r.left,y:r.top,w:r.width,h:r.height};"
+        + "}).sort((a,b)=>b.score-a.score||a.index-b.index);"
+        + "const frame=frames[0];"
         + "if(!frame)return null;frame.scrollIntoView({block:'center',inline:'center'});"
-        + "const r=frame.getBoundingClientRect();"
-        + "return {x:r.left,y:r.top,w:r.width,h:r.height};"
+        + "const r=frame.iframe.getBoundingClientRect();"
+        + "return {x:r.left,y:r.top,w:r.width,h:r.height,match:frame.match,index:frame.index};"
         + "})()"));
     if (point.isEmpty()) {
       return "";
@@ -1929,7 +2045,8 @@ final class JagexCdpAutomation {
       cdp.send("Input.dispatchMouseEvent", mouse("mouseReleased", px, py, "left", 1));
       sleep(250);
     }
-    return "challenge frame bounds";
+    return "challenge frame bounds index=" + Json.number(point.get("index")).intValue()
+        + " match=" + Json.number(point.get("match")).intValue();
   }
 
   private String clickHumanCheckProceedInContext(CdpClient cdp, boolean includeIframes) {
@@ -1961,6 +2078,12 @@ final class JagexCdpAutomation {
         + "if(frame){frame.scrollIntoView({block:'center',inline:'center'});const r=frame.getBoundingClientRect();"
         + "return {x:r.left+Math.min(38,Math.max(18,r.width*0.18)),y:r.top+r.height/2,label:'challenge frame'};}"
         : "")
+        + (includeIframes ? "" :
+        "const body=document.body;"
+        + "if(body){const r=body.getBoundingClientRect();const width=Math.max(r.width,window.innerWidth||0);"
+        + "const height=Math.max(r.height,window.innerHeight||0);if(width>0&&height>0){"
+        + "return {x:r.left+Math.min(42,Math.max(20,width*0.18)),y:r.top+height/2,label:'challenge body'};}}"
+        )
         + "return null;"
         + "})()"));
     if (point.isEmpty()) {

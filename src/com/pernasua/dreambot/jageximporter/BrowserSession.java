@@ -15,27 +15,37 @@ final class BrowserSession implements AutoCloseable {
   private final Runnable hideAction;
   private final Consumer<JagexOAuthClient.AuthRequest> authRequestAction;
   private final Consumer<String> navigateAction;
+  private final NativeClickAction nativeClickAction;
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
   BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
       boolean keepOpen, AutoCloseable closeAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, null, null, null);
+    this(engine, endpoint, port, headless, keepOpen, closeAction, null, null, null, null, null);
   }
 
   BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
       boolean keepOpen, AutoCloseable closeAction, Runnable revealAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, null, null);
+    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, null, null, null, null);
   }
 
   BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
       boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
       Consumer<JagexOAuthClient.AuthRequest> authRequestAction) {
-    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction, authRequestAction, null);
+    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction,
+        authRequestAction, null, null);
   }
 
   BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
       boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
       Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction) {
+    this(engine, endpoint, port, headless, keepOpen, closeAction, revealAction, hideAction,
+        authRequestAction, navigateAction, null);
+  }
+
+  BrowserSession(BrowserEngine engine, String endpoint, int port, boolean headless,
+      boolean keepOpen, AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
+      Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction,
+      NativeClickAction nativeClickAction) {
     this.engine = engine;
     this.endpoint = endpoint;
     this.port = port;
@@ -46,6 +56,7 @@ final class BrowserSession implements AutoCloseable {
     this.hideAction = hideAction == null ? () -> { } : hideAction;
     this.authRequestAction = authRequestAction == null ? ignored -> { } : authRequestAction;
     this.navigateAction = navigateAction == null ? ignored -> { } : navigateAction;
+    this.nativeClickAction = nativeClickAction == null ? (x, y, label) -> "" : nativeClickAction;
   }
 
   void reveal() {
@@ -64,6 +75,10 @@ final class BrowserSession implements AutoCloseable {
     navigateAction.accept(url);
   }
 
+  String nativeClick(double viewportX, double viewportY, String label) {
+    return nativeClickAction.click(viewportX, viewportY, label);
+  }
+
   @Override
   public void close() {
     if (!closed.compareAndSet(false, true)) {
@@ -76,5 +91,10 @@ final class BrowserSession implements AutoCloseable {
     } catch (Exception exception) {
       throw new IllegalStateException("could not close browser session", exception);
     }
+  }
+
+  @FunctionalInterface
+  interface NativeClickAction {
+    String click(double viewportX, double viewportY, String label);
   }
 }

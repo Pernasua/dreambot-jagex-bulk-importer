@@ -42,7 +42,8 @@ final class DreamBotAccountStore {
 
   static Info info(Path db) throws IOException, GeneralSecurityException {
     DecodedStore decoded = readDecoded(db);
-    return new Info(decoded.rows.size(), codecLabel(decoded.aad), decoded.aad);
+    String codec = decoded.aad == BUILT_IN_AAD_INT ? "built-in" : "aes-gcm-aad";
+    return new Info(decoded.rows.size(), codec, decoded.aad);
   }
 
   static BackupContext backupContext() {
@@ -119,6 +120,30 @@ final class DreamBotAccountStore {
 
   static List<Map<String, Object>> read(Path db) throws IOException, GeneralSecurityException {
     return readDecoded(db).rows;
+  }
+
+  static boolean containsLogin(Path db, String email) throws IOException, GeneralSecurityException {
+    String key = String.valueOf(email == null ? "" : email).trim().toLowerCase(Locale.ROOT);
+    if (key.isEmpty()) {
+      return false;
+    }
+    for (Map<String, Object> row : read(db)) {
+      if (matchesLogin(row, key)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean matchesLogin(Map<String, Object> row, String emailKey) {
+    return loginFieldMatches(row.get("ssoEmail"), emailKey)
+        || loginFieldMatches(row.get("username"), emailKey)
+        || loginFieldMatches(row.get("nickname"), emailKey);
+  }
+
+  private static boolean loginFieldMatches(Object value, String emailKey) {
+    String text = Json.string(value).trim().toLowerCase(Locale.ROOT);
+    return text.equals(emailKey) || text.startsWith(emailKey + " (");
   }
 
   private static DecodedStore readDecoded(Path db) throws IOException, GeneralSecurityException {
@@ -199,20 +224,10 @@ final class DreamBotAccountStore {
     Files.move(tmp, db, StandardCopyOption.REPLACE_EXISTING);
   }
 
-  static void writeForTest(Path db, List<Map<String, Object>> rows) throws IOException, GeneralSecurityException {
-    write(db, rows, BUILT_IN_AAD_INT);
-  }
-
-  static void writeForTest(Path db, List<Map<String, Object>> rows, int aad)
-      throws IOException, GeneralSecurityException {
-    write(db, rows, aad);
-  }
-
   private static int verifyPersistedCount(Path db, int expected) throws IOException, GeneralSecurityException {
     int persisted = read(db).size();
     if (persisted != expected) {
-      throw new IOException("accounts.db write verification failed: expected " + expected
-          + " account(s), found " + persisted);
+      throw new IOException("accounts.db write verification failed");
     }
     return persisted;
   }
@@ -352,10 +367,6 @@ final class DreamBotAccountStore {
     return db.toAbsolutePath().normalize().toString();
   }
 
-  private static String codecLabel(int aad) {
-    return aad == BUILT_IN_AAD_INT ? "built-in" : "aes-gcm-aad";
-  }
-
   static byte[] hex(String value) {
     byte[] out = new byte[value.length() / 2];
     for (int i = 0; i < out.length; i++) {
@@ -375,9 +386,9 @@ final class DreamBotAccountStore {
   static final class Info {
     final int count;
     final String codec;
-    final Integer aad;
+    final int aad;
 
-    Info(int count, String codec, Integer aad) {
+    Info(int count, String codec, int aad) {
       this.count = count;
       this.codec = codec;
       this.aad = aad;

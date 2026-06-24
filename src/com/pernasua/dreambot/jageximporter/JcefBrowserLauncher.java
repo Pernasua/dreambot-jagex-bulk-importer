@@ -1,6 +1,11 @@
 package com.pernasua.dreambot.jageximporter;
 
 import java.awt.BorderLayout;
+import java.awt.Component;
+import java.awt.Frame;
+import java.awt.Point;
+import java.awt.Robot;
+import java.awt.event.InputEvent;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,7 +44,7 @@ final class JcefBrowserLauncher {
 
   static BrowserSession launch(Path installDir, int requestedPort, boolean keepOpen, boolean headless,
       Consumer<String> log) throws Exception {
-    Consumer<String> safeLog = log == null ? ignored -> { } : log;
+    Consumer<String> safeLog = DiagnosticSanitizer.consumer(log);
     requireDisplayIfLinux();
     int port = ensureApp(installDir, requestedPort, safeLog);
     CefClient client = app.createClient();
@@ -55,7 +60,8 @@ final class JcefBrowserLauncher {
         () -> revealBrowser(frame),
         () -> hideBrowser(frame),
         referrers::register,
-        url -> loadUrl(browser, url));
+        url -> loadUrl(browser, url),
+        (x, y, label) -> nativeViewportClick(browser, frame, x, y, label, safeLog));
   }
 
   static Path defaultInstallDir() {
@@ -193,6 +199,67 @@ final class JcefBrowserLauncher {
     } catch (Exception exception) {
       throw new IllegalStateException("could not navigate embedded JCEF browser", exception);
     }
+  }
+
+  private static String nativeViewportClick(CefBrowser browser, JFrame frame, double viewportX,
+      double viewportY, String label, Consumer<String> log) {
+    if (browser == null || frame == null) {
+      return "";
+    }
+    int[] click = new int[2];
+    int[] componentSize = new int[2];
+    try {
+      SwingUtilities.invokeAndWait(() -> {
+        Component component = browser.getUIComponent();
+        if ((frame.getExtendedState() & Frame.ICONIFIED) != 0) {
+          frame.setExtendedState(frame.getExtendedState() & ~Frame.ICONIFIED);
+        }
+        frame.setVisible(true);
+        frame.toFront();
+        frame.requestFocus();
+        component.requestFocus();
+        component.requestFocusInWindow();
+        Point origin = component.getLocationOnScreen();
+        int width = Math.max(1, component.getWidth());
+        int height = Math.max(1, component.getHeight());
+        int localX = clamp((int) Math.round(viewportX), 1, width - 2);
+        int localY = clamp((int) Math.round(viewportY), 1, height - 2);
+        click[0] = origin.x + localX;
+        click[1] = origin.y + localY;
+        componentSize[0] = width;
+        componentSize[1] = height;
+      });
+      Thread.sleep(120L);
+      Robot robot = new Robot();
+      robot.setAutoDelay(35);
+      robot.mouseMove(click[0], click[1]);
+      robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+      robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+      robot.waitForIdle();
+      return "JCEF component " + safeLabel(label)
+          + " viewport=" + Math.round(viewportX) + "," + Math.round(viewportY)
+          + " size=" + componentSize[0] + "x" + componentSize[1];
+    } catch (Exception exception) {
+      log.accept("embedded JCEF native click failed: " + brief(exception.getMessage()));
+      return "";
+    }
+  }
+
+  private static int clamp(int value, int min, int max) {
+    if (max < min) {
+      return min;
+    }
+    return Math.max(min, Math.min(max, value));
+  }
+
+  private static String safeLabel(String label) {
+    String text = label == null || label.isBlank() ? "browser click" : label.trim();
+    return text.length() > 80 ? text.substring(0, 80) : text;
+  }
+
+  private static String brief(String value) {
+    String text = DiagnosticSanitizer.sanitize(value == null ? "" : value).replaceAll("\\s+", " ").trim();
+    return text.length() > 220 ? text.substring(0, 220) : text;
   }
 
   private static Path defaultRoot() {

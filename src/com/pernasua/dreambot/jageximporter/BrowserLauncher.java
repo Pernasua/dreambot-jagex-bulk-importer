@@ -283,7 +283,7 @@ final class BrowserLauncher {
       if (text.length() > 600) {
         text = text.substring(text.length() - 600);
       }
-      return ": " + text;
+      return ": " + DiagnosticSanitizer.sanitize(text);
     } catch (Exception ignored) {
       return "";
     }

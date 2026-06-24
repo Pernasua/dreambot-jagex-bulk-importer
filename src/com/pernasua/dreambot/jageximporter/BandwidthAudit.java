@@ -35,7 +35,7 @@ final class BandwidthAudit {
       Record record = ACTIVE_BROWSER.computeIfAbsent(requestId, ignored -> new Record());
       record.requestId = requestId;
       record.method = safe(method, "GET");
-      record.url = safe(url, "");
+      record.url = DiagnosticSanitizer.sanitizeUrl(safe(url, ""));
       record.host = host(url);
       record.type = safe(resourceType, "other").toLowerCase(Locale.ROOT);
       record.source = "browser";
@@ -74,7 +74,7 @@ final class BandwidthAudit {
     record.source = "api";
     record.type = safe(type, "http").toLowerCase(Locale.ROOT);
     record.method = safe(request.method(), "GET");
-    record.url = request.uri().toString();
+    record.url = DiagnosticSanitizer.sanitizeUrl(request.uri().toString());
     record.host = host(record.url);
     record.status = response.statusCode();
     record.requestHeaderBytes = estimateRequestHeaderBytes(record.method, record.url, flattenHeaders(request.headers().map()));

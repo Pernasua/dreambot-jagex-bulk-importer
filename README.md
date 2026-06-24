@@ -23,6 +23,9 @@ java -jar dist/dreambot-jagex-bulk-importer.jar \
   --db /path/to/DreamBot/BotData/accounts.db
 ```
 
+If `--db` is omitted, the importer makes one attempt to auto-detect a common
+DreamBot `BotData/accounts.db` path.
+
 Input rows use:
 
 ```text
@@ -40,10 +43,10 @@ and the last separator for the TOTP secret.
 | --- | --- |
 | `--gui` | Open the Swing GUI. Running the jar with no arguments does the same thing. |
 | `--help`, `-h` | Print usage. |
-| `--input PATH --db PATH` | Import rows from a file into `accounts.db`. |
-| `--stdin --db PATH` | Import rows from standard input. |
+| `--input PATH [--db PATH]` | Import rows from a file into `accounts.db`. |
+| `--stdin [--db PATH]` | Import rows from standard input. |
 | `--db-info PATH` | Print JSON with account count, account-store codec label, and AAD. |
-| `--db-browser PATH` | Open a masked table view of `accounts.db`. |
+| `--db-browser PATH` | Open a full table view of `accounts.db`. |
 | `--browser-check` | Launch the configured browser and report DevTools status. |
 | `--page-state --devtools-port N` | Print JSON describing the current browser page. |
 | `--totp SECRET` | Print the current TOTP code for a base32 secret. |
@@ -52,13 +55,13 @@ and the last separator for the TOTP secret.
 
 ### Import Flags
 
-These flags apply to `--input ... --db ...` and `--stdin --db ...`.
+These flags apply to `--input ...` and `--stdin` import runs.
 
 | Flag | Description |
 | --- | --- |
 | `--input PATH` | Account list file. Required unless `--stdin` is used. |
 | `--stdin` | Read account rows from standard input. |
-| `--db PATH` | DreamBot `BotData/accounts.db` to update. Required. |
+| `--db PATH` | DreamBot `BotData/accounts.db` to update. Auto-detected if omitted. |
 | `--start N` | First 1-based source row to import. Default: `1`. |
 | `--end N` | Last 1-based source row to import. Default: last row. |
 | `--ledger PATH` | Non-secret JSONL result ledger. Default: next to `accounts.db`. |
@@ -70,7 +73,7 @@ These flags apply to `--input ... --db ...` and `--stdin --db ...`.
 | `--headed` | Show the selected browser window. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
-| `--keep-browser-open` | Leave the browser open after import attempts. |
+| `--keep-browser-open` | Reuse Browser Instance. Leaves the browser open after import attempts. |
 | `--allow-dreambot-running` | Bypass the DreamBot process guard for isolated DB copies. |
 | `--dry-run` | Parse rows, validate TOTP secrets, and decrypt DB without importing. |
 | `--mail-code-helper PATH` | Helper command used when login needs an email verification code. |
@@ -149,9 +152,11 @@ java -jar dist/dreambot-jagex-bulk-importer.jar \
 java -jar dist/dreambot-jagex-bulk-importer.jar
 ```
 
-The GUI has start, pause/resume, and stop controls. Selecting an `accounts.db`
-file shows its current account count. `View DB` opens a masked table view of the
-account rows. When a run finishes, the GUI opens the ledger file.
+The GUI has start, pause/resume, and stop controls. It makes one startup attempt
+to auto-detect the `accounts.db` path. Selecting an `accounts.db` file does not
+parse or decrypt it. `View DB` opens a full table view of the account rows.
+`Reuse Browser Instance` maps to the `--keep-browser-open` CLI flag. When a run
+finishes, the GUI opens the ledger file.
 
 ## Behavior Notes
 
@@ -175,7 +180,7 @@ account rows. When a run finishes, the GUI opens the ledger file.
 - The ledger does not include account identifiers, passwords, TOTP secrets, OTP
   values, or OAuth tokens. Use row indexes to map results back to the input file.
 - Each successful write is reopened and verified against the encrypted
-  `accounts.db`; a final ledger row records the verified DB count.
+  `accounts.db`.
 - Wrong passwords and rejected authenticator codes are skipped with explicit ledger
   statuses: `invalid_credentials`, `invalid_otp_code`, or `account_locked`.
 - Human-check handling logs detection reason, click attempts, screenshot paths,
