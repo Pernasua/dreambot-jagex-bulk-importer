@@ -1,4 +1,4 @@
-# DreamBot Jagex Bulk Importer
+# Pernasua DreamBot Jagex Bulk Importer
 
 Standalone Java importer for adding legacy and Jagex accounts to a DreamBot
 `BotData/accounts.db`.
@@ -73,7 +73,7 @@ These flags apply to `--input ...` and `--stdin` import runs.
 | `--headed` | Show the selected browser window. |
 | `--devtools-port N` | Browser DevTools port. Default: auto. |
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
-| `--keep-browser-open` | Reuse Browser Instance. Leaves the browser open after import attempts. |
+| `--keep-browser-open` | Leave the browser open after import attempts. |
 | `--allow-dreambot-running` | Bypass the DreamBot process guard for isolated DB copies. |
 | `--dry-run` | Parse rows, validate TOTP secrets, and decrypt DB without importing. |
 | `--mail-code-helper PATH` | Helper command used when login needs an email verification code. |
@@ -155,8 +155,7 @@ java -jar dist/dreambot-jagex-bulk-importer.jar
 The GUI has start, pause/resume, and stop controls. It makes one startup attempt
 to auto-detect the `accounts.db` path. Selecting an `accounts.db` file does not
 parse or decrypt it. `View DB` opens a full table view of the account rows.
-`Reuse Browser Instance` maps to the `--keep-browser-open` CLI flag. When a run
-finishes, the GUI opens the ledger file.
+When a run finishes, the GUI opens the ledger file.
 
 ## Behavior Notes
 

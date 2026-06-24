@@ -347,7 +347,7 @@ public final class DreamBotJagexBulkImporter {
         "  --headed                  Show the selected browser window",
         "  --devtools-port N         Browser DevTools port (default: auto)",
         "  --human-check-wait-ms N   Max wait for browser challenge pages (default: 300000)",
-        "  --keep-browser-open       Reuse Browser Instance; leave browser open after import attempts",
+        "  --keep-browser-open       Leave browser open after import attempts",
         "  --allow-dreambot-running Bypass the DreamBot process guard for isolated DB copies",
         "  --dry-run                 Parse rows, validate TOTP, and decrypt DB without importing",
         "  --mail-code-helper PATH   Helper used when login needs an email verification code",
@@ -968,7 +968,6 @@ public final class DreamBotJagexBulkImporter {
     private final JButton viewDb = new JButton("View DB");
     private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
-    private final JCheckBox keepBrowserOpen = new JCheckBox("Reuse Browser Instance");
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
@@ -979,7 +978,7 @@ public final class DreamBotJagexBulkImporter {
     private GuiRunControl runControl;
 
     void show() {
-      JFrame frame = new JFrame("DreamBot Jagex Bulk Importer");
+      JFrame frame = new JFrame("Pernasua DreamBot Jagex Bulk Importer");
       frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
       frame.setLayout(new BorderLayout(8, 8));
 
@@ -999,7 +998,6 @@ public final class DreamBotJagexBulkImporter {
       pause.setEnabled(false);
       stop.setEnabled(false);
       buttons.add(headless);
-      buttons.add(keepBrowserOpen);
       buttons.add(start);
       buttons.add(pause);
       buttons.add(stop);
@@ -1120,7 +1118,6 @@ public final class DreamBotJagexBulkImporter {
       config.db = db.getText().trim().isEmpty() ? null : Paths.get(db.getText().trim());
       config.browserEngine = engine.getSelectedIndex() == 0 ? BrowserEngine.JCEF : BrowserEngine.SYSTEM;
       config.headless = headless.isSelected();
-      config.keepBrowserOpen = keepBrowserOpen.isSelected();
 
       GuiRunControl control = new GuiRunControl();
       runControl = control;
