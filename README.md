@@ -43,6 +43,10 @@ When a run finishes, the GUI opens the ledger file.
 ## Notes
 
 - Does not require DreamBot.
+- Close DreamBot before importing. The importer refuses to write while a DreamBot
+  process appears to be running or another process has `accounts.db` open,
+  because DreamBot can overwrite `accounts.db` with an older in-memory account
+  list.
 - Does not bundle Chromium/JCEF browser binaries.
 - Downloads the JCEF runtime on first embedded-browser use, then reuses the cache.
 - Default JCEF cache:
@@ -51,9 +55,10 @@ When a run finishes, the GUI opens the ledger file.
 - Linux embedded JCEF needs a display server. Use a desktop session or `xvfb-run`.
 - `--system-browser` can use installed Chrome, Chromium, or Edge instead.
 - The ledger is a JSONL audit file for row results. DreamBot does not read it.
-- The ledger includes full emails, but not passwords, TOTP secrets, OTP values, or OAuth tokens.
-- Use `--debug-secrets` only while troubleshooting. It prints the normalized
-  TOTP secret, generated OTP code, counter, and OTP input-field selection.
+- The ledger does not include account identifiers, passwords, TOTP secrets, OTP
+  values, or OAuth tokens. Use row indexes to map results back to the input file.
+- Each successful write is reopened and verified against the encrypted
+  `accounts.db`; a final ledger row records the verified DB count.
 - Wrong passwords and rejected authenticator codes are skipped with explicit ledger
   statuses: `invalid_credentials`, `invalid_otp_code`, or `account_locked`.
 
@@ -63,5 +68,5 @@ When a run finishes, the GUI opens the ledger file.
 java -jar dist/dreambot-jagex-bulk-importer.jar --db-info /path/to/accounts.db
 java -jar dist/dreambot-jagex-bulk-importer.jar --browser-check
 java -jar dist/dreambot-jagex-bulk-importer.jar --totp BASE32SECRET
-java -jar dist/dreambot-jagex-bulk-importer.jar --input accounts.txt --db /path/to/accounts.db --dry-run --debug-secrets
+java -jar dist/dreambot-jagex-bulk-importer.jar --input accounts.txt --db /path/to/accounts.db --dry-run
 ```

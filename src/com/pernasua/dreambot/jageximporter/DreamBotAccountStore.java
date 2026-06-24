@@ -83,7 +83,8 @@ final class DreamBotAccountStore {
       }
       Path backup = backupContext == null ? backup(db) : backupContext.ensure(db);
       write(db, rows);
-      return new AddResult(before, rows.size(), addedLabels.size(), addedLabels, backup);
+      int persisted = verifyPersistedCount(db, rows.size());
+      return new AddResult(before, persisted, addedLabels.size(), addedLabels, backup);
     }
   }
 
@@ -105,7 +106,8 @@ final class DreamBotAccountStore {
       rows.add(classicRecord(account, nickname(account, profile)));
       Path backup = backupContext == null ? backup(db) : backupContext.ensure(db);
       write(db, rows);
-      return new AddResult(before, rows.size(), 1, List.of(account.email), backup);
+      int persisted = verifyPersistedCount(db, rows.size());
+      return new AddResult(before, persisted, 1, List.of(account.email), backup);
     }
   }
 
@@ -139,6 +141,19 @@ final class DreamBotAccountStore {
       // Windows.
     }
     Files.move(tmp, db, StandardCopyOption.REPLACE_EXISTING);
+  }
+
+  static void writeForTest(Path db, List<Map<String, Object>> rows) throws IOException, GeneralSecurityException {
+    write(db, rows);
+  }
+
+  private static int verifyPersistedCount(Path db, int expected) throws IOException, GeneralSecurityException {
+    int persisted = read(db).size();
+    if (persisted != expected) {
+      throw new IOException("accounts.db write verification failed: expected " + expected
+          + " account(s), found " + persisted);
+    }
+    return persisted;
   }
 
   private static Map<String, Object> record(String label, DreamBotJagexBulkImporter.AccountRow account,

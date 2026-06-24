@@ -12,10 +12,29 @@ final class Totp {
   }
 
   static String normalizeSecret(String value) {
-    return String.valueOf(value == null ? "" : value)
+    return extractOtpauthSecret(String.valueOf(value == null ? "" : value).trim())
         .replaceAll("[\\s-]+", "")
         .replaceAll("=+$", "")
         .toUpperCase(Locale.ROOT);
+  }
+
+  // Accept a full otpauth:// URI (the kind copied from a QR-code export) and pull out the secret=
+  // parameter, so a pasted URI is not treated as the raw secret.
+  private static String extractOtpauthSecret(String raw) {
+    if (raw.toLowerCase(Locale.ROOT).indexOf("otpauth://") < 0) {
+      return raw;
+    }
+    int query = raw.indexOf('?');
+    if (query < 0) {
+      return raw;
+    }
+    for (String param : raw.substring(query + 1).split("&")) {
+      int eq = param.indexOf('=');
+      if (eq > 0 && param.substring(0, eq).trim().equalsIgnoreCase("secret")) {
+        return param.substring(eq + 1).trim();
+      }
+    }
+    return raw;
   }
 
   static void validateSecret(String value) {
@@ -68,7 +87,10 @@ final class Totp {
       throw new IllegalArgumentException("OTP secret is required");
     }
     if (!clean.matches("[A-Z2-7]+")) {
-      throw new IllegalArgumentException("OTP secret must be valid base32 text");
+      String offenders = clean.replaceAll("[A-Z2-7]", "");
+      throw new IllegalArgumentException("OTP secret is not valid base32 (offending characters: \""
+          + offenders + "\"). Base32 uses A-Z and 2-7 only; 0/1/8/9 are not valid, and O/I are often"
+          + " mistyped for 0/1. Make sure this is the authenticator seed, not a recovery code.");
     }
 
     int outputLength = clean.length() * 5 / 8;

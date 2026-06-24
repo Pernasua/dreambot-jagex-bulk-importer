@@ -6,24 +6,33 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JFileChooser;
@@ -40,12 +49,25 @@ import javax.swing.SwingWorker;
 
 public final class DreamBotJagexBulkImporter {
   private static final long DEFAULT_HUMAN_CHECK_WAIT_MS = 300_000L;
-  private static final int MAX_TEMPORARY_OAUTH_ATTEMPTS = 3;
+  private static final int MAX_TEMPORARY_OAUTH_ATTEMPTS =
+      positiveEnvInt("DREAMBOT_JAGEX_IMPORTER_TEMP_OAUTH_ATTEMPTS", 4);
   private static final Progress NO_PROGRESS = new Progress() { };
   private static final DateTimeFormatter FILE_STAMP =
       DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC);
 
   private DreamBotJagexBulkImporter() {
+  }
+
+  private static int positiveEnvInt(String name, int fallback) {
+    String raw = String.valueOf(System.getenv(name) == null ? "" : System.getenv(name)).trim();
+    if (raw.isEmpty()) {
+      return fallback;
+    }
+    try {
+      return Math.max(1, Integer.parseInt(raw));
+    } catch (NumberFormatException ignored) {
+      return fallback;
+    }
   }
 
   public static void main(String[] args) {
@@ -112,6 +134,7 @@ public final class DreamBotJagexBulkImporter {
       boolean effectiveHeadless = headless == null ? engine == BrowserEngine.JCEF : headless;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
       try (BrowserSession session = launchBrowser(engine, browser, jcefDir, port, false, effectiveHeadless,
+          null,
           message -> System.err.println(message))) {
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
@@ -135,6 +158,143 @@ public final class DreamBotJagexBulkImporter {
         System.out.println(Json.stringify(value));
       }
       return 0;
+    }
+    if ("--enroll-only".equals(argv.get(0))) {
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      List<String> rows = new ArrayList<>();
+      if (options.containsKey("input")) {
+        for (String line : Files.readAllLines(Paths.get(options.get("input")), StandardCharsets.UTF_8)) {
+          String trimmed = line.trim();
+          if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
+            rows.add(trimmed);
+          }
+        }
+      }
+      if (options.containsKey("account")) {
+        rows.add(options.get("account"));
+      }
+      if (rows.isEmpty()) {
+        throw new IllegalArgumentException("--enroll-only requires --input PATH or --account email:password");
+      }
+      BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
+      if (options.containsKey("system-browser")) {
+        engine = BrowserEngine.SYSTEM;
+      } else if (options.containsKey("embedded-browser")) {
+        engine = BrowserEngine.JCEF;
+      }
+      String browserPath = options.getOrDefault("browser", "");
+      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
+      Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
+      int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
+      long humanWait = options.containsKey("human-check-wait-ms")
+          ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
+      boolean headless = engine == BrowserEngine.JCEF;
+      if (options.containsKey("headed")) {
+        headless = !isTruthy(options.get("headed"));
+      } else if (options.containsKey("headless")) {
+        headless = isTruthy(options.get("headless"));
+      }
+      Path ledger = options.containsKey("ledger") ? Paths.get(options.get("ledger")) : null;
+      Path bandwidthOut = ledger == null ? null : defaultBandwidth(ledger);
+      String mailCodeHelper = options.getOrDefault("mail-code-helper",
+          "/root/projects/dreambot/tools/2b2m_mail_code.py");
+      int ok = 0;
+      BandwidthAudit.reset();
+      try {
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+          String row = rows.get(rowIndex);
+          int displayIndex = rowIndex + 1;
+          String[] parts = row.split(":", -1);
+          String email = parts[0].trim();
+          String password = parts.length > 1 ? parts[1] : "";
+          if (email.isEmpty() || password.isEmpty()) {
+            System.err.println("skip malformed row " + displayIndex);
+            continue;
+          }
+          try (BrowserSession browser = launchBrowser(engine, browserPath, jcefDir, port, false, headless,
+              userDataDir,
+              message -> System.err.println("row " + displayIndex + " " + message))) {
+            JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
+                message -> System.err.println("row " + displayIndex + " " + message));
+            String secret = automation.enrollAuthenticator(email, password, mailCodeHelper);
+            ok++;
+            System.out.println(email + ":" + password + ":" + secret);
+            if (ledger != null) {
+              LinkedHashMap<String, Object> entry = new LinkedHashMap<>();
+              entry.put("index", displayIndex);
+              entry.put("status", "enrolled");
+              Files.writeString(ledger, Json.stringify(entry) + "\n", StandardCharsets.UTF_8,
+                  java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            }
+          } catch (Exception exception) {
+            String message = redactValues(exception.getMessage() == null ? exception.toString() : exception.getMessage(),
+                email, password);
+            System.err.println("row " + displayIndex + " enrollment failed: " + message);
+            if (ledger != null) {
+              LinkedHashMap<String, Object> entry = new LinkedHashMap<>();
+              entry.put("index", displayIndex);
+              entry.put("status", "enroll_failed");
+              entry.put("error", message);
+              Files.writeString(ledger, Json.stringify(entry) + "\n", StandardCharsets.UTF_8,
+                  java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            }
+          }
+        }
+      } finally {
+        if (bandwidthOut != null) {
+          BandwidthAudit.write(bandwidthOut);
+          chmod600(bandwidthOut);
+        }
+      }
+      return ok == rows.size() ? 0 : 1;
+    }
+    if ("--disable-email-only".equals(argv.get(0))) {
+      Map<String, String> options = parseOptions(argv.subList(1, argv.size()));
+      String account = options.get("account");
+      if (account == null || account.isEmpty()) {
+        throw new IllegalArgumentException("--disable-email-only requires --account email:password:secret");
+      }
+      String[] parts = account.split(":", -1);
+      String email = parts[0].trim();
+      String password = parts.length > 1 ? parts[1] : "";
+      String secret = parts.length > 2 ? parts[2].trim() : "";
+      if (email.isEmpty() || password.isEmpty() || secret.isEmpty()) {
+        throw new IllegalArgumentException("--account must be email:password:secret");
+      }
+      BrowserEngine engine = BrowserEngine.parse(options.getOrDefault("browser-engine", "jcef"));
+      if (options.containsKey("system-browser")) {
+        engine = BrowserEngine.SYSTEM;
+      } else if (options.containsKey("embedded-browser")) {
+        engine = BrowserEngine.JCEF;
+      }
+      String browserPath = options.getOrDefault("browser", "");
+      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
+      Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
+      int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
+      long humanWait = options.containsKey("human-check-wait-ms")
+          ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
+      boolean headless = engine == BrowserEngine.JCEF;
+      if (options.containsKey("headed")) {
+        headless = !isTruthy(options.get("headed"));
+      } else if (options.containsKey("headless")) {
+        headless = isTruthy(options.get("headless"));
+      }
+      String mailCodeHelper = options.getOrDefault("mail-code-helper",
+          "/root/projects/dreambot/tools/2b2m_mail_code.py");
+      try (BrowserSession browser = launchBrowser(engine, browserPath, jcefDir, port, false, headless,
+          userDataDir,
+          message -> System.err.println("disable-email " + message))) {
+        JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
+            message -> System.err.println("disable-email " + message));
+        String result = automation.disableEmailOnly(email, password, secret, mailCodeHelper);
+        System.out.println(result);
+        return 0;
+      } catch (Exception exception) {
+        String message = redactValues(exception.getMessage() == null ? exception.toString() : exception.getMessage(),
+            email, password, secret);
+        System.err.println("disable-email failed: " + message);
+        return 1;
+      }
     }
     Config config = Config.parse(argv);
     return new Importer(config, System.out::println).run();
@@ -172,13 +332,14 @@ public final class DreamBotJagexBulkImporter {
         "  --embedded-browser        Use the embedded JCEF browser (default)",
         "  --system-browser          Use installed Chrome, Chromium, or Edge",
         "  --browser PATH            System Chrome, Chromium, or Edge executable",
+        "  --user-data-dir PATH      Reuse a system-browser profile directory",
         "  --jcef-dir PATH           Embedded JCEF native-runtime cache directory",
         "  --headless                Run system browser headless; embedded JCEF starts minimized/internal",
         "  --headed                  Show the selected browser window",
         "  --devtools-port N         Browser DevTools port (default: auto)",
         "  --human-check-wait-ms N   Max wait for browser challenge pages (default: 300000)",
         "  --keep-browser-open       Leave browser open after import attempts",
-        "  --debug-secrets           Log TOTP secrets and generated codes for debugging",
+        "  --allow-dreambot-running Bypass the DreamBot process guard for isolated DB copies",
         "  --dry-run                 Parse rows, validate TOTP, and decrypt DB without importing",
         "  --totp SECRET             Utility mode: print the current generated TOTP code"));
   }
@@ -192,11 +353,12 @@ public final class DreamBotJagexBulkImporter {
   }
 
   private static BrowserSession launchBrowser(BrowserEngine engine, String browserPath, Path jcefDir,
-      int devtoolsPort, boolean keepBrowserOpen, boolean headless, Consumer<String> log) throws Exception {
+      int devtoolsPort, boolean keepBrowserOpen, boolean headless, Path userDataDir,
+      Consumer<String> log) throws Exception {
     if (engine == BrowserEngine.JCEF) {
       return JcefBrowserLauncher.launch(jcefDir, devtoolsPort, keepBrowserOpen, headless, log);
     }
-    return BrowserLauncher.launch(browserPath, devtoolsPort, keepBrowserOpen, headless);
+    return BrowserLauncher.launch(browserPath, devtoolsPort, keepBrowserOpen, headless, userDataDir);
   }
 
   private static final class Importer {
@@ -205,6 +367,7 @@ public final class DreamBotJagexBulkImporter {
     private final Progress progress;
     private final RunControl control;
     private final DreamBotAccountStore.BackupContext backupContext = DreamBotAccountStore.backupContext();
+    private int expectedDbCount = -1;
 
     Importer(Config config, Consumer<String> log) {
       this(config, log, NO_PROGRESS);
@@ -233,67 +396,86 @@ public final class DreamBotJagexBulkImporter {
       if (config.start < 1 || config.start > end) {
         throw new IllegalArgumentException("invalid row range: " + config.start + " to " + end);
       }
-      if (config.ledger == null) {
-        config.ledger = defaultLedger(config.db);
-      }
-      Files.createDirectories(config.ledger.toAbsolutePath().getParent());
+      try {
+        if (config.ledger == null) {
+          config.ledger = defaultLedger(config.db);
+        }
+        if (config.bandwidthOut == null) {
+          config.bandwidthOut = defaultBandwidth(config.ledger);
+        }
+        Files.createDirectories(config.ledger.toAbsolutePath().getParent());
+        BandwidthAudit.reset();
+        if (!config.dryRun) {
+          guardDreamBotNotRunning(config, log);
+          guardAccountsDbNotOpen(config.db);
+        }
+        warnIfDbPathLooksUnexpected(config.db, log);
 
-      DreamBotAccountStore.Info info = DreamBotAccountStore.info(config.db);
-      log.accept("DB opened: " + info.count + " accounts");
-      log.accept("Loaded " + rows.size() + " account row(s); importing rows " + config.start + "-" + end);
-      log.accept("Ledger: " + config.ledger + " (JSONL row-status audit; not used as the account database)");
-      if (!config.dryRun) {
-        log.accept(browserSummary(config));
-      }
+        DreamBotAccountStore.Info info = DreamBotAccountStore.info(config.db);
+        expectedDbCount = info.count;
+        log.accept("DB opened: " + info.count + " accounts");
+        log.accept("Loaded " + rows.size() + " account row(s); importing rows " + config.start + "-" + end);
+        log.accept("Ledger: " + config.ledger + " (JSONL row-status audit; not used as the account database)");
+        log.accept("Bandwidth: " + config.bandwidthOut + " (JSON summary for browser/API traffic)");
+        if (!config.dryRun) {
+          log.accept(browserSummary(config));
+        }
 
-      int failures = 0;
-      JagexOAuthClient oauth = new JagexOAuthClient();
-      int total = end - config.start + 1;
-      progress.total(total);
-      for (int rowIndex = config.start; rowIndex <= end; rowIndex++) {
-        control.checkpoint();
-        AccountRow account = rows.get(rowIndex - 1).withIndex(rowIndex);
-        int completedBefore = rowIndex - config.start;
-        progress.row(completedBefore, total, "Starting row " + account.index + " " + account.email);
-        try {
-          String status = importOne(oauth, account);
-          progress.row(completedBefore + 1, total, "Row " + account.index + " " + status);
-        } catch (CancellationException exception) {
-          throw exception;
-        } catch (JagexCdpAutomation.TerminalAuthException exception) {
-          String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
-          log.accept("row " + account.index + " skipped: " + detail);
-          record(account, exception.status(), detail, 0, null);
-          progress.row(completedBefore + 1, total, "Row " + account.index + " " + exception.status());
-        } catch (Exception exception) {
-          failures++;
-          String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
-          log.accept("row " + account.index + " failed: " + detail);
-          record(account, "failed", detail, 0, null);
-          progress.row(completedBefore + 1, total, "Row " + account.index + " failed");
+        int failures = 0;
+        JagexOAuthClient oauth = new JagexOAuthClient(message -> log.accept(message));
+        int total = end - config.start + 1;
+        progress.total(total);
+        for (int rowIndex = config.start; rowIndex <= end; rowIndex++) {
+          control.checkpoint();
+          AccountRow account = rows.get(rowIndex - 1).withIndex(rowIndex);
+          int completedBefore = rowIndex - config.start;
+          progress.row(completedBefore, total, "Starting row " + account.index);
+          try {
+            String status = importOne(oauth, account);
+            progress.row(completedBefore + 1, total, "Row " + account.index + " " + status);
+          } catch (CancellationException exception) {
+            throw exception;
+          } catch (JagexCdpAutomation.TerminalAuthException exception) {
+            String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
+            log.accept("row " + account.index + " skipped: " + detail);
+            record(account, exception.status(), detail, 0, null);
+            progress.row(completedBefore + 1, total, "Row " + account.index + " " + exception.status());
+          } catch (Exception exception) {
+            failures++;
+            String detail = redact(account, exception.getMessage() == null ? exception.toString() : exception.getMessage());
+            String exceptionType = exception.getClass().getName();
+            java.io.StringWriter stackBuffer = new java.io.StringWriter();
+            exception.printStackTrace(new java.io.PrintWriter(stackBuffer));
+            log.accept("row " + account.index + " failed: " + detail);
+            log.accept("row " + account.index + " failed type: " + exceptionType);
+            log.accept("row " + account.index + " failed stack: " + truncate(redact(account, stackBuffer.toString()), 4000));
+            record(account, "failed", detail, 0, null);
+            progress.row(completedBefore + 1, total, "Row " + account.index + " failed");
+          }
+        }
+        DreamBotAccountStore.Info finalInfo = verifyFinalDbCount();
+        recordRun(failures == 0 ? "finished" : "finished_with_failures",
+            "Final DB verified with " + finalInfo.count + " account(s)", finalInfo.count);
+        log.accept("Final DB verified: " + finalInfo.count + " accounts");
+        return failures == 0 ? 0 : 1;
+      } finally {
+        if (config.bandwidthOut != null) {
+          BandwidthAudit.write(config.bandwidthOut);
+          chmod600(config.bandwidthOut);
         }
       }
-      return failures == 0 ? 0 : 1;
     }
 
     private String importOne(JagexOAuthClient oauth, AccountRow account) throws Exception {
       control.checkpoint();
       account.validate();
-      log.accept("row " + account.index + " " + account.email + " start");
+      log.accept("row " + account.index + " start");
       log.accept("row " + account.index + " input validated; OTP secret accepted");
       if (config.dryRun) {
         Totp.Code code = Totp.generate(account.otpSecret);
         record(account, "dry_run_ok", "validated row, generated TOTP, and decrypted DB", 0, null);
-        if (config.debugSecrets) {
-          String normalizedSecret = Totp.normalizeSecret(account.otpSecret);
-          log.accept("row " + account.index + " generated TOTP code " + code.value + "; period "
-              + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter
-              + ", secret " + normalizedSecret
-              + ", secret_sha256 " + sha256(normalizedSecret));
-        } else {
-          log.accept("row " + account.index + " generated TOTP code; value hidden, period "
-              + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter);
-        }
+        log.accept("row " + account.index + " generated TOTP code; value hidden, period "
+            + code.period + "s, " + code.remainingSeconds + "s remaining, counter " + code.counter);
         log.accept("row " + account.index + " dry-run ok");
         return "dry_run_ok";
       }
@@ -301,10 +483,11 @@ public final class DreamBotJagexBulkImporter {
       for (int attempt = 1; attempt <= MAX_TEMPORARY_OAUTH_ATTEMPTS; attempt++) {
         control.checkpoint();
         try (BrowserSession browser = launchBrowser(config.browserEngine, config.browserPath, config.jcefDir,
-            config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(),
+            config.devtoolsPort, config.keepBrowserOpen, config.isHeadless(), config.userDataDir,
               message -> log.accept("row " + account.index + " " + message))) {
           JagexCdpAutomation automation = new JagexCdpAutomation(browser, config.humanCheckWaitMs,
-              message -> log.accept("row " + account.index + " " + message), control, config.debugSecrets);
+              message -> log.accept("row " + account.index + " " + message), control);
+          automation.setImportMailCodeHelper(config.mailCodeHelper);
 
           log.accept("row " + account.index + " launcher OAuth attempt " + attempt
               + "/" + MAX_TEMPORARY_OAUTH_ATTEMPTS + " starting");
@@ -324,8 +507,10 @@ public final class DreamBotJagexBulkImporter {
             control.checkpoint();
             log.accept("row " + account.index + " fetching legacy RuneScape profile");
             JagexOAuthClient.RunescapeProfile profile = oauth.fetchRunescapeProfile(tokens.idToken);
+            guardAccountsDbNotOpen(config.db);
             DreamBotAccountStore.AddResult result =
                 DreamBotAccountStore.addLegacyAccount(config.db, account, profile, backupContext);
+            result = verifyStoreResult(result, "legacy account add");
             if (result.addedCount == 0) {
               log.accept("row " + account.index + " already present");
               record(account, "already_present", "", 0, null);
@@ -350,11 +535,20 @@ public final class DreamBotJagexBulkImporter {
           log.accept("row " + account.index + " consent OAuth callback received; fetching game session");
 
           control.checkpoint();
-          JagexOAuthClient.GameSession session = oauth.fetchGameSession(consentCallback.idToken);
+          JagexOAuthClient.GameSession session;
+          try {
+            session = oauth.fetchGameSession(consentCallback.idToken);
+          } catch (java.io.IOException exception) {
+            throw new JagexCdpAutomation.TemporaryOAuthException(
+                "game-session transport failure after consent OAuth: "
+                    + shortReason(exception.getMessage() == null ? exception.toString() : exception.getMessage()));
+          }
           log.accept("row " + account.index + " game session fetched; " + session.accounts.size()
               + " character account(s)");
+          guardAccountsDbNotOpen(config.db);
           DreamBotAccountStore.AddResult result =
               DreamBotAccountStore.addJagexAccount(config.db, account, tokens, session, backupContext);
+          result = verifyStoreResult(result, "Jagex account add");
           if (result.addedCount == 0) {
             log.accept("row " + account.index + " already present");
             record(account, "already_present", "", 0, null);
@@ -368,12 +562,40 @@ public final class DreamBotJagexBulkImporter {
           if (attempt >= MAX_TEMPORARY_OAUTH_ATTEMPTS) {
             throw exception;
           }
-          log.accept("row " + account.index + " temporary Jagex OAuth page; retrying with fresh browser "
+          log.accept("row " + account.index + " temporary Jagex OAuth page ("
+              + shortReason(exception.getMessage()) + "); retrying with fresh browser "
               + (attempt + 1) + "/" + MAX_TEMPORARY_OAUTH_ATTEMPTS);
           sleepBeforeRetry(attempt);
         }
       }
       throw new IllegalStateException("temporary Jagex OAuth retry loop ended unexpectedly");
+    }
+
+    private DreamBotAccountStore.AddResult verifyStoreResult(DreamBotAccountStore.AddResult result,
+        String action) throws Exception {
+      if (expectedDbCount >= 0 && result.beforeCount != expectedDbCount) {
+        throw new IllegalStateException("accounts.db changed outside the importer before " + action
+            + ": expected " + expectedDbCount + " account(s), found " + result.beforeCount
+            + ". Close DreamBot and rerun so it cannot overwrite the account store.");
+      }
+      DreamBotAccountStore.Info persisted = DreamBotAccountStore.info(config.db);
+      if (persisted.count != result.afterCount) {
+        throw new IllegalStateException("accounts.db verification failed after " + action
+            + ": expected " + result.afterCount + " account(s), found " + persisted.count
+            + ". Close DreamBot and rerun so it cannot overwrite the account store.");
+      }
+      expectedDbCount = persisted.count;
+      return result;
+    }
+
+    private DreamBotAccountStore.Info verifyFinalDbCount() throws Exception {
+      DreamBotAccountStore.Info persisted = DreamBotAccountStore.info(config.db);
+      if (expectedDbCount >= 0 && persisted.count != expectedDbCount) {
+        throw new IllegalStateException("accounts.db final verification failed: expected "
+            + expectedDbCount + " account(s), found " + persisted.count
+            + ". Close DreamBot and rerun so it cannot overwrite the account store.");
+      }
+      return persisted;
     }
 
     private String browserSummary(Config config) {
@@ -389,6 +611,14 @@ public final class DreamBotJagexBulkImporter {
 
     private void sleepBeforeRetry(int attempt) {
       control.sleep(Math.min(15_000L, 4_000L * attempt));
+    }
+
+    private String shortReason(String message) {
+      String reason = message == null ? "" : message.replaceAll("\\s+", " ").trim();
+      if (reason.length() > 220) {
+        return reason.substring(0, 220) + "...";
+      }
+      return reason.isEmpty() ? "no detail" : reason;
     }
 
     private List<AccountRow> readRowsFromStdin() throws IOException {
@@ -427,8 +657,7 @@ public final class DreamBotJagexBulkImporter {
       LinkedHashMap<String, Object> row = new LinkedHashMap<>();
       row.put("at", Instant.now().toString());
       row.put("index", account.index);
-      row.put("email", account.email);
-      row.put("email_hash", sha256(account.email.toLowerCase(Locale.ROOT)));
+      row.put("source_line", account.sourceLine);
       row.put("status", status);
       if (addedCount > 0) {
         row.put("added_count", addedCount);
@@ -438,6 +667,20 @@ public final class DreamBotJagexBulkImporter {
       }
       if (detail != null && !detail.trim().isEmpty()) {
         row.put("detail", truncate(redact(account, detail), 700));
+      }
+      Files.writeString(config.ledger, Json.stringify(row) + "\n", StandardCharsets.UTF_8,
+          java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+      chmod600(config.ledger);
+    }
+
+    private void recordRun(String status, String detail, int dbCount) throws IOException {
+      LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+      row.put("at", Instant.now().toString());
+      row.put("scope", "run");
+      row.put("status", status);
+      row.put("db_count", dbCount);
+      if (detail != null && !detail.trim().isEmpty()) {
+        row.put("detail", truncate(detail, 700));
       }
       Files.writeString(config.ledger, Json.stringify(row) + "\n", StandardCharsets.UTF_8,
           java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
@@ -497,17 +740,20 @@ public final class DreamBotJagexBulkImporter {
     Path input;
     Path db;
     Path ledger;
+    Path bandwidthOut;
     boolean stdin;
     int start = 1;
     int end = -1;
     BrowserEngine browserEngine = BrowserEngine.JCEF;
     String browserPath = "";
+    Path userDataDir;
     Path jcefDir;
     int devtoolsPort = 0;
     long humanCheckWaitMs = DEFAULT_HUMAN_CHECK_WAIT_MS;
     boolean keepBrowserOpen;
-    boolean debugSecrets;
     boolean dryRun;
+    boolean allowDreamBotRunning;
+    String mailCodeHelper = "";
     Boolean headless;
 
     boolean isHeadless() {
@@ -556,6 +802,9 @@ public final class DreamBotJagexBulkImporter {
               config.browserEngine = BrowserEngine.SYSTEM;
             }
             break;
+          case "--user-data-dir":
+            config.userDataDir = Paths.get(requireValue(argv, ++i, arg));
+            break;
           case "--jcef-dir":
             config.jcefDir = Paths.get(requireValue(argv, ++i, arg));
             break;
@@ -565,11 +814,14 @@ public final class DreamBotJagexBulkImporter {
           case "--human-check-wait-ms":
             config.humanCheckWaitMs = Long.parseLong(requireValue(argv, ++i, arg));
             break;
+          case "--mail-code-helper":
+            config.mailCodeHelper = requireValue(argv, ++i, arg);
+            break;
           case "--keep-browser-open":
             config.keepBrowserOpen = true;
             break;
-          case "--debug-secrets":
-            config.debugSecrets = true;
+          case "--allow-dreambot-running":
+            config.allowDreamBotRunning = true;
             break;
           case "--headless":
             config.headless = true;
@@ -597,7 +849,6 @@ public final class DreamBotJagexBulkImporter {
     private final JComboBox<String> engine = new JComboBox<>(new String[] {"Embedded JCEF", "System Chrome/Edge"});
     private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JCheckBox keepBrowserOpen = new JCheckBox("Keep browser open");
-    private final JCheckBox debugSecrets = new JCheckBox("Debug OTP values");
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
@@ -627,7 +878,6 @@ public final class DreamBotJagexBulkImporter {
       stop.setEnabled(false);
       buttons.add(headless);
       buttons.add(keepBrowserOpen);
-      buttons.add(debugSecrets);
       buttons.add(start);
       buttons.add(pause);
       buttons.add(stop);
@@ -706,7 +956,6 @@ public final class DreamBotJagexBulkImporter {
       config.browserEngine = engine.getSelectedIndex() == 0 ? BrowserEngine.JCEF : BrowserEngine.SYSTEM;
       config.headless = headless.isSelected();
       config.keepBrowserOpen = keepBrowserOpen.isSelected();
-      config.debugSecrets = debugSecrets.isSelected();
 
       GuiRunControl control = new GuiRunControl();
       runControl = control;
@@ -887,12 +1136,205 @@ public final class DreamBotJagexBulkImporter {
     }
   }
 
+  private static void guardDreamBotNotRunning(Config config, Consumer<String> log) {
+    if (config.allowDreamBotRunning) {
+      log.accept("DreamBot process guard bypassed; only use this for isolated DB copies");
+      return;
+    }
+    int matches = 0;
+    long currentPid = ProcessHandle.current().pid();
+    for (ProcessHandle process : ProcessHandle.allProcesses().toArray(ProcessHandle[]::new)) {
+      if (process.pid() == currentPid) {
+        continue;
+      }
+      if (looksLikeDreamBotProcess(process.info())) {
+        matches++;
+      }
+    }
+    if (matches > 0) {
+      throw new IllegalStateException("DreamBot appears to be running. Close DreamBot before writing accounts.db, "
+          + "then rerun the importer. Use --allow-dreambot-running only for an isolated DB copy.");
+    }
+  }
+
+  private static void guardAccountsDbNotOpen(Path db) {
+    Path absolute = db.toAbsolutePath().normalize();
+    if (!Files.isRegularFile(absolute)) {
+      return;
+    }
+    List<Long> openPids = accountsDbOpenPids(absolute);
+    if (!openPids.isEmpty()) {
+      throw new IllegalStateException("accounts.db is open by another process (pid"
+          + (openPids.size() == 1 ? "" : "s") + " " + joinPids(openPids)
+          + "). Close DreamBot or any account-manager/editor using accounts.db, then rerun the importer.");
+    }
+    probeExclusiveDbAccess(absolute);
+  }
+
+  private static List<Long> accountsDbOpenPids(Path db) {
+    LinkedHashSet<Long> pids = new LinkedHashSet<>();
+    String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+    if (os.contains("win")) {
+      addWindowsHandlePids(db, pids);
+    } else {
+      Path lsof = findCommand("lsof");
+      if (lsof != null) {
+        addPidMatches(pids, runCommand(List.of(lsof.toString(), "-t", db.toString())), Pattern.compile("\\b(\\d+)\\b"));
+      }
+      Path fuser = findCommand("fuser");
+      if (fuser != null) {
+        addPidMatches(pids, runCommand(List.of(fuser.toString(), db.toString())), Pattern.compile("\\b(\\d+)\\b"));
+      }
+    }
+    long currentPid = ProcessHandle.current().pid();
+    pids.remove(currentPid);
+    return new ArrayList<>(pids);
+  }
+
+  private static void addWindowsHandlePids(Path db, Set<Long> pids) {
+    String explicit = System.getenv("DREAMBOT_JAGEX_IMPORTER_HANDLE_EXE");
+    Path handle = explicit == null || explicit.isBlank()
+        ? findCommand("handle64.exe", "handle.exe")
+        : Paths.get(explicit);
+    if (handle == null || !Files.isRegularFile(handle)) {
+      return;
+    }
+    String output = runCommand(List.of(handle.toString(), "-nobanner", "-accepteula", db.toString()));
+    addPidMatches(pids, output, Pattern.compile("(?i)\\bpid:\\s*(\\d+)\\b"));
+  }
+
+  private static void probeExclusiveDbAccess(Path db) {
+    try (FileChannel channel = FileChannel.open(db, StandardOpenOption.WRITE);
+        FileLock lock = channel.tryLock()) {
+      if (lock == null) {
+        throw new IllegalStateException("accounts.db is locked by another process. Close DreamBot or any "
+            + "account-manager/editor using accounts.db, then rerun the importer.");
+      }
+    } catch (OverlappingFileLockException exception) {
+      throw new IllegalStateException("accounts.db is already locked in this process", exception);
+    } catch (IOException exception) {
+      throw new IllegalStateException("accounts.db could not be opened for exclusive write access. Close DreamBot "
+          + "or any account-manager/editor using accounts.db, then rerun the importer. Detail: "
+          + exception.getMessage(), exception);
+    }
+  }
+
+  private static Path findCommand(String... names) {
+    String path = System.getenv("PATH");
+    if (path == null || path.isBlank()) {
+      return null;
+    }
+    for (String dir : path.split(Pattern.quote(File.pathSeparator))) {
+      if (dir == null || dir.isBlank()) {
+        continue;
+      }
+      for (String name : names) {
+        Path candidate = Paths.get(dir, name);
+        if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+
+  private static String runCommand(List<String> command) {
+    try {
+      Process process = new ProcessBuilder(command).start();
+      boolean finished = process.waitFor(3, TimeUnit.SECONDS);
+      if (!finished) {
+        process.destroyForcibly();
+        return "";
+      }
+      return new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    } catch (Exception ignored) {
+      return "";
+    }
+  }
+
+  private static void addPidMatches(Set<Long> pids, String output, Pattern pattern) {
+    Matcher matcher = pattern.matcher(output == null ? "" : output);
+    while (matcher.find()) {
+      try {
+        pids.add(Long.parseLong(matcher.group(1)));
+      } catch (NumberFormatException ignored) {
+        // Ignore malformed tool output.
+      }
+    }
+  }
+
+  private static String joinPids(List<Long> pids) {
+    StringBuilder out = new StringBuilder();
+    for (Long pid : pids) {
+      if (out.length() > 0) {
+        out.append(", ");
+      }
+      out.append(pid);
+    }
+    return out.toString();
+  }
+
+  private static boolean looksLikeDreamBotProcess(ProcessHandle.Info info) {
+    StringBuilder text = new StringBuilder();
+    String command = info.command().orElse("");
+    text.append(command).append(' ');
+    info.arguments().ifPresent(arguments -> {
+      for (String argument : arguments) {
+        text.append(argument).append(' ');
+      }
+    });
+    String lower = text.toString().toLowerCase(Locale.ROOT);
+    if (!lower.contains("dreambot") || lower.contains("dreambot-jagex-bulk-importer")) {
+      return false;
+    }
+    if (lower.contains("dreambot-mcp.jar")
+        || lower.contains("dreambot_mcp.py")
+        || lower.contains("dreambot_harness.py")
+        || lower.contains("dreambot-account-factory")
+        || lower.contains("dreambot-task-harness")
+        || lower.contains("dreambot-run-task-queue")
+        || lower.contains("panel/server.py")) {
+      return false;
+    }
+    String commandBase = "";
+    if (!command.isBlank()) {
+      try {
+        commandBase = Paths.get(command).getFileName().toString().toLowerCase(Locale.ROOT);
+      } catch (Exception ignored) {
+        commandBase = command.toLowerCase(Locale.ROOT);
+      }
+    }
+    return lower.contains("botdata")
+        || lower.contains("client.jar")
+        || lower.contains("dreambot.jar")
+        || lower.contains("dreambotlauncher")
+        || "dreambot".equals(commandBase)
+        || "dreambot.exe".equals(commandBase);
+  }
+
+  private static void warnIfDbPathLooksUnexpected(Path db, Consumer<String> log) {
+    String normalized = db.toAbsolutePath().normalize().toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+    if (!normalized.endsWith("/botdata/accounts.db")) {
+      log.accept("Warning: selected accounts.db is not under a DreamBot BotData directory; verify this is the DB DreamBot loads");
+    }
+  }
+
   private static Path defaultLedger(Path db) {
     Path parent = db.toAbsolutePath().getParent();
     if (parent == null) {
       parent = Paths.get(".");
     }
     return parent.resolve("jagex-bulk-import-" + FILE_STAMP.format(Instant.now()) + ".jsonl");
+  }
+
+  private static Path defaultBandwidth(Path ledger) {
+    String name = ledger.getFileName() == null ? "jagex-bulk-import.jsonl" : ledger.getFileName().toString();
+    String stem = name.endsWith(".jsonl") ? name.substring(0, name.length() - 6) : name;
+    Path parent = ledger.toAbsolutePath().getParent();
+    if (parent == null) {
+      parent = Paths.get(".");
+    }
+    return parent.resolve(stem + ".bandwidth.json");
   }
 
   private static String requireValue(List<String> argv, int index, String option) {
@@ -953,24 +1395,22 @@ public final class DreamBotJagexBulkImporter {
     }
     String redacted = text;
     if (account != null) {
-      redacted = redacted.replace(account.password, "<password>")
-          .replace(account.otpSecret, "<otp-secret>");
+      redacted = redactValues(redacted, account.email, account.password, account.otpSecret);
     }
     return redacted;
   }
 
-  private static String sha256(String value) {
-    try {
-      MessageDigest digest = MessageDigest.getInstance("SHA-256");
-      byte[] bytes = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-      StringBuilder out = new StringBuilder(bytes.length * 2);
-      for (byte b : bytes) {
-        out.append(String.format("%02x", b & 0xFF));
-      }
-      return out.toString();
-    } catch (Exception exception) {
-      throw new IllegalStateException("could not hash account identifier", exception);
+  private static String redactValues(String text, String... values) {
+    String redacted = text == null ? "" : text;
+    if (values == null) {
+      return redacted;
     }
+    for (String value : values) {
+      if (value != null && !value.isEmpty()) {
+        redacted = redacted.replace(value, "<redacted>");
+      }
+    }
+    return redacted;
   }
 
   private static String truncate(String value, int max) {

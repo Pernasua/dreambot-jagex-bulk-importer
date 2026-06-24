@@ -1,12 +1,15 @@
 package com.pernasua.dreambot.jageximporter;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -33,13 +36,27 @@ final class JagexOAuthClient {
       "openid offline gamesso.token.create user.profile.read user.entitlement.read "
           + "user.game.read user.sku.read user.voucher.redeem";
   private static final String CONSENT_SCOPE = "openid offline";
+  private static final int GAME_SESSION_HTTP_RETRIES = 3;
+  private static final Duration GAME_SESSION_CREATE_HTTP_TIMEOUT = Duration.ofSeconds(45);
+  private static final Duration GAME_SESSION_LIST_HTTP_TIMEOUT = Duration.ofSeconds(30);
   private static final char[] ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
   private static final SecureRandom RANDOM = new SecureRandom();
 
-  private final HttpClient http = HttpClient.newBuilder()
-      .connectTimeout(Duration.ofSeconds(20))
-      .followRedirects(HttpClient.Redirect.NEVER)
-      .build();
+  private final HttpClient http;
+  private final java.util.function.Consumer<String> log;
+
+  JagexOAuthClient() {
+    this(message -> { });
+  }
+
+  JagexOAuthClient(java.util.function.Consumer<String> log) {
+    this.log = log == null ? message -> { } : log;
+    HttpClient.Builder builder = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(20))
+        .followRedirects(HttpClient.Redirect.NEVER);
+    configureProxy(builder);
+    this.http = builder.build();
+  }
 
   AuthRequest launcherAuthRequest() {
     String state = randomAlnum(24);
@@ -88,6 +105,7 @@ final class JagexOAuthClient {
         .POST(HttpRequest.BodyPublishers.ofString(form(form)))
         .build();
     HttpResponse<String> response = http.send(tokenRequest, HttpResponse.BodyHandlers.ofString());
+    BandwidthAudit.httpExchange("launcher-token", tokenRequest, response);
     if (response.statusCode() < 200 || response.statusCode() >= 300) {
       throw new IllegalStateException("launcher token exchange failed with HTTP " + response.statusCode()
           + ": " + safeHttpError(response.body()));
@@ -112,13 +130,22 @@ final class JagexOAuthClient {
     LinkedHashMap<String, Object> body = new LinkedHashMap<>();
     body.put("idToken", idToken);
     HttpRequest sessionRequest = HttpRequest.newBuilder(URI.create(GAME_SESSION_URL))
-        .timeout(Duration.ofSeconds(30))
+        .timeout(GAME_SESSION_CREATE_HTTP_TIMEOUT)
         .header("Content-Type", "application/json")
         .POST(HttpRequest.BodyPublishers.ofString(Json.stringify(body)))
         .build();
-    HttpResponse<String> sessionResponse = http.send(sessionRequest, HttpResponse.BodyHandlers.ofString());
-    if (sessionResponse.statusCode() < 200 || sessionResponse.statusCode() >= 300) {
-      throw new IllegalStateException("game-session create failed with HTTP " + sessionResponse.statusCode()
+    HttpResponse<String> sessionResponse = sendGameSessionRequest("session create", sessionRequest, false);
+    int sessionStatus = sessionResponse.statusCode();
+    if (sessionStatus == 409 && idTokenAlreadyUsed(sessionResponse.body())) {
+      throw new IOException("game-session create rejected a previously consumed consent token: "
+          + safeHttpError(sessionResponse.body()));
+    }
+    if (isTemporaryGameSessionStatus(sessionStatus)) {
+      throw new IOException("game-session create temporary HTTP " + sessionStatus + ": "
+          + safeHttpError(sessionResponse.body()));
+    }
+    if (sessionStatus < 200 || sessionStatus >= 300) {
+      throw new IllegalStateException("game-session create failed with HTTP " + sessionStatus
           + ": " + safeHttpError(sessionResponse.body()));
     }
     String sessionId = Json.string(Json.asObject(Json.parse(sessionResponse.body())).get("sessionId"));
@@ -127,13 +154,18 @@ final class JagexOAuthClient {
     }
 
     HttpRequest accountsRequest = HttpRequest.newBuilder(URI.create(GAME_ACCOUNTS_URL))
-        .timeout(Duration.ofSeconds(30))
+        .timeout(GAME_SESSION_LIST_HTTP_TIMEOUT)
         .header("Authorization", "Bearer " + sessionId)
         .GET()
         .build();
-    HttpResponse<String> accountsResponse = http.send(accountsRequest, HttpResponse.BodyHandlers.ofString());
-    if (accountsResponse.statusCode() < 200 || accountsResponse.statusCode() >= 300) {
-      throw new IllegalStateException("game-session account list failed with HTTP " + accountsResponse.statusCode()
+    HttpResponse<String> accountsResponse = sendGameSessionRequest("accounts list", accountsRequest, true);
+    int accountsStatus = accountsResponse.statusCode();
+    if (isTemporaryGameSessionStatus(accountsStatus)) {
+      throw new IOException("game-session account list temporary HTTP " + accountsStatus + ": "
+          + safeHttpError(accountsResponse.body()));
+    }
+    if (accountsStatus < 200 || accountsStatus >= 300) {
+      throw new IllegalStateException("game-session account list failed with HTTP " + accountsStatus
           + ": " + safeHttpError(accountsResponse.body()));
     }
     ArrayList<CharacterAccount> accounts = new ArrayList<>();
@@ -151,6 +183,63 @@ final class JagexOAuthClient {
     return new GameSession(sessionId, accounts);
   }
 
+  private HttpResponse<String> sendGameSessionRequest(String label, HttpRequest request,
+      boolean retryOnTimeout) throws IOException, InterruptedException {
+    IOException lastIo = null;
+    HttpResponse<String> lastResponse = null;
+    for (int attempt = 1; attempt <= GAME_SESSION_HTTP_RETRIES; attempt++) {
+      long startedAt = System.currentTimeMillis();
+      log.accept("game-session " + label + " attempt " + attempt + "/" + GAME_SESSION_HTTP_RETRIES + " starting");
+      try {
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        BandwidthAudit.httpExchange("game-session-" + label.replace(' ', '-'), request, response);
+        lastResponse = response;
+        int status = response.statusCode();
+        long elapsedMs = System.currentTimeMillis() - startedAt;
+        log.accept("game-session " + label + " attempt " + attempt + "/" + GAME_SESSION_HTTP_RETRIES
+            + " returned HTTP " + status + " after " + elapsedMs + "ms");
+        if ((status == 429 || status >= 500) && attempt < GAME_SESSION_HTTP_RETRIES) {
+          Thread.sleep(Math.min(15_000L, 3_000L * attempt));
+          continue;
+        }
+        return response;
+      } catch (IOException exception) {
+        lastIo = exception;
+        long elapsedMs = System.currentTimeMillis() - startedAt;
+        log.accept("game-session " + label + " attempt " + attempt + "/" + GAME_SESSION_HTTP_RETRIES
+            + " failed after " + elapsedMs + "ms: " + exception.getClass().getSimpleName()
+            + " " + safeHttpError(exception.getMessage()));
+        if (exception instanceof HttpTimeoutException && !retryOnTimeout) {
+          throw new HttpTimeoutException("game-session " + label + " request timed out after "
+              + attempt + " attempt" + (attempt == 1 ? "" : "s"));
+        }
+        if (attempt >= GAME_SESSION_HTTP_RETRIES) {
+          if (exception instanceof HttpTimeoutException) {
+            throw new HttpTimeoutException("game-session " + label + " request timed out after "
+                + GAME_SESSION_HTTP_RETRIES + " attempts");
+          }
+          throw exception;
+        }
+        Thread.sleep(Math.min(15_000L, 3_000L * attempt));
+      }
+    }
+    if (lastIo != null) {
+      throw lastIo;
+    }
+    if (lastResponse != null) {
+      return lastResponse;
+    }
+    throw new IOException("game-session request did not produce a response");
+  }
+
+  private boolean isTemporaryGameSessionStatus(int status) {
+    return status == 408 || status == 425 || status == 429 || status >= 500;
+  }
+
+  private boolean idTokenAlreadyUsed(String body) {
+    return safeHttpError(body).toUpperCase(Locale.ROOT).contains("ID_TOKEN_ALREADY_USED");
+  }
+
   RunescapeProfile fetchRunescapeProfile(String idToken) throws IOException, InterruptedException {
     HttpRequest request = HttpRequest.newBuilder(URI.create(RS_PROFILE_URL))
         .timeout(Duration.ofSeconds(30))
@@ -158,6 +247,7 @@ final class JagexOAuthClient {
         .GET()
         .build();
     HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+    BandwidthAudit.httpExchange("rs-profile", request, response);
     if (response.statusCode() < 200 || response.statusCode() >= 300) {
       throw new IllegalStateException("RuneScape profile lookup failed with HTTP " + response.statusCode()
           + ": " + safeHttpError(response.body()));
@@ -253,7 +343,7 @@ final class JagexOAuthClient {
   }
 
   private static String launcherReferrer() {
-    return "https://" + randomLauncherReferrerToken() + ".skin/";
+    return "";
   }
 
   private static String randomLauncherReferrerToken() {
@@ -306,6 +396,50 @@ final class JagexOAuthClient {
       return text.substring(0, 240);
     }
     return text;
+  }
+
+  private void configureProxy(HttpClient.Builder builder) {
+    String rawServer = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_SERVER", "")).trim();
+    if (rawServer.isEmpty()) {
+      return;
+    }
+    String rawUser = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_USER", "")).trim();
+    String rawPass = String.valueOf(System.getenv().getOrDefault("CLOAK_PROXY_PASS", "")).trim();
+    try {
+      URI uri = URI.create(rawServer);
+      String scheme = String.valueOf(uri.getScheme() == null ? "" : uri.getScheme()).toLowerCase(Locale.ROOT);
+      String host = uri.getHost();
+      int port = uri.getPort();
+      if (host == null || host.isBlank() || port <= 0) {
+        log.accept("game-session proxy ignored; could not parse " + rawServer);
+        return;
+      }
+      if (scheme.startsWith("socks")) {
+        System.setProperty("socksProxyHost", host);
+        System.setProperty("socksProxyPort", String.valueOf(port));
+        if (!rawUser.isEmpty()) {
+          System.setProperty("java.net.socks.username", rawUser);
+        }
+        if (!rawPass.isEmpty()) {
+          System.setProperty("java.net.socks.password", rawPass);
+        }
+        log.accept("game-session HTTP client using SOCKS proxy " + host + ":" + port);
+        return;
+      }
+      builder.proxy(ProxySelector.of(new InetSocketAddress(host, port)));
+      if (!rawUser.isEmpty()) {
+        builder.authenticator(new java.net.Authenticator() {
+          @Override
+          protected java.net.PasswordAuthentication getPasswordAuthentication() {
+            return new java.net.PasswordAuthentication(rawUser, rawPass.toCharArray());
+          }
+        });
+      }
+      log.accept("game-session HTTP client using proxy " + host + ":" + port);
+    } catch (Exception exception) {
+      log.accept("game-session proxy ignored; invalid CLOAK_PROXY_SERVER " + rawServer + " ("
+          + exception.getClass().getSimpleName() + ")");
+    }
   }
 
   static final class AuthRequest {

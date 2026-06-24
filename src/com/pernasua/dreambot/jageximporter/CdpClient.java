@@ -31,9 +31,11 @@ final class CdpClient implements AutoCloseable {
   private final List<Map<String, Object>> events = new ArrayList<>();
   private final WebSocket socket;
   private final StringBuilder partialText = new StringBuilder();
+  private final String sessionKey;
 
   private CdpClient(WebSocket socket) {
     this.socket = socket;
+    this.sessionKey = Integer.toHexString(System.identityHashCode(socket));
   }
 
   static List<Target> targets(String baseUrl) throws IOException, InterruptedException {
@@ -204,6 +206,7 @@ final class CdpClient implements AutoCloseable {
       }
       return;
     }
+    recordBandwidthEvent(message);
     synchronized (events) {
       events.add(message);
       if (events.size() > 500) {
@@ -213,9 +216,52 @@ final class CdpClient implements AutoCloseable {
     }
   }
 
+  private void recordBandwidthEvent(Map<String, Object> message) {
+    String method = Json.string(message.get("method"));
+    Map<String, Object> params = Json.asObject(message.get("params"));
+    String requestKey = sessionKey + ":" + Json.string(params.get("requestId"));
+    if ("Network.requestWillBeSent".equals(method)) {
+      Map<String, Object> request = Json.asObject(params.get("request"));
+      BandwidthAudit.browserRequest(
+          requestKey,
+          Json.string(request.get("method")),
+          Json.string(request.get("url")),
+          Json.asObject(request.get("headers")),
+          Json.string(params.get("type")),
+          Json.string(request.get("postData")));
+      return;
+    }
+    if ("Network.responseReceived".equals(method)) {
+      Map<String, Object> response = Json.asObject(params.get("response"));
+      BandwidthAudit.browserResponse(
+          requestKey,
+          Json.number(response.get("status")).intValue(),
+          Json.asObject(response.get("headers")));
+      return;
+    }
+    if ("Network.loadingFinished".equals(method)) {
+      BandwidthAudit.browserFinished(requestKey,
+          Json.number(params.get("encodedDataLength")).longValue(), false);
+      return;
+    }
+    if ("Network.loadingFailed".equals(method)) {
+      BandwidthAudit.browserFinished(requestKey, 0L, true);
+    }
+  }
+
   @Override
   public void close() {
-    socket.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
+    try {
+      socket.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
+    } catch (RuntimeException exception) {
+      String message = String.valueOf(exception.getMessage()).toLowerCase(java.util.Locale.ROOT);
+      Throwable cause = exception.getCause();
+      String causeMessage = cause == null ? "" : String.valueOf(cause.getMessage()).toLowerCase(java.util.Locale.ROOT);
+      if (message.contains("output closed") || causeMessage.contains("output closed")) {
+        return;
+      }
+      throw exception;
+    }
   }
 
   static final class Target {

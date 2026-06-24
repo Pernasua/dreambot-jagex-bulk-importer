@@ -1,8 +1,11 @@
 package com.pernasua.dreambot.jageximporter;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -11,14 +14,24 @@ import java.util.Locale;
 
 final class BrowserLauncher {
   private static final Duration STARTUP_TIMEOUT = Duration.ofSeconds(35);
-
   private BrowserLauncher() {
   }
 
   static BrowserSession launch(String explicitBrowser, int requestedPort, boolean keepOpen, boolean headless) throws Exception {
+    return launch(explicitBrowser, requestedPort, keepOpen, headless, null);
+  }
+
+  static BrowserSession launch(String explicitBrowser, int requestedPort, boolean keepOpen, boolean headless,
+      Path userDataDir) throws Exception {
     String browser = locateBrowser(explicitBrowser);
     int port = requestedPort > 0 ? requestedPort : Ports.freePort();
-    Path profile = Files.createTempDirectory("dreambot-jagex-importer-browser-");
+    Path profile = userDataDir == null
+        ? Files.createTempDirectory("dreambot-jagex-importer-browser-")
+        : userDataDir.toAbsolutePath();
+    if (userDataDir != null) {
+      Files.createDirectories(profile);
+      cleanupStaleProfileLocks(profile);
+    }
 
     ArrayList<String> command = new ArrayList<>();
     command.add(browser);
@@ -26,6 +39,38 @@ final class BrowserLauncher {
       command.add("--headless=new");
       command.add("--disable-gpu");
       command.add("--disable-dev-shm-usage");
+    }
+    String cloakSeed = System.getenv("CLOAK_FP_SEED");
+    String cloakTimezone = System.getenv("CLOAK_TZ");
+    String cloakLocale = System.getenv("CLOAK_LOCALE");
+    String cloakExitIp = System.getenv("CLOAK_EXIT_IP");
+    String cloakProxyServer = System.getenv("CLOAK_PROXY_SERVER");
+    String cloakProxyUser = System.getenv("CLOAK_PROXY_USER");
+    String cloakProxyPass = System.getenv("CLOAK_PROXY_PASS");
+    if (cloakSeed != null && !cloakSeed.isBlank()) {
+      command.add("--disable-blink-features=AutomationControlled");
+      command.add("--enable-features=BarcodeDetector");
+      command.add("--fingerprint=" + cloakSeed.trim());
+      command.add("--fingerprint-platform=windows");
+      command.add("--ignore-gpu-blocklist");
+    }
+    if (cloakTimezone != null && !cloakTimezone.isBlank()) {
+      command.add("--fingerprint-timezone=" + cloakTimezone.trim());
+    }
+    if (cloakLocale != null && !cloakLocale.isBlank()) {
+      command.add("--lang=" + cloakLocale.trim());
+      command.add("--fingerprint-locale=" + cloakLocale.trim());
+    }
+    if (cloakExitIp != null && !cloakExitIp.isBlank()) {
+      command.add("--fingerprint-webrtc-ip=" + cloakExitIp.trim());
+    }
+    String proxyArg = chromiumProxyArg(cloakProxyServer, cloakProxyUser, cloakProxyPass);
+    if (!proxyArg.isEmpty()) {
+      command.add("--proxy-server=" + proxyArg);
+      if (!proxyArg.toLowerCase(Locale.ROOT).startsWith("socks")) {
+        command.add("--disable-quic");
+      }
+      command.add("--proxy-bypass-list=<-loopback>");
     }
     command.add("--remote-debugging-address=127.0.0.1");
     command.add("--remote-debugging-port=" + port);
@@ -47,12 +92,13 @@ final class BrowserLauncher {
     long deadline = System.currentTimeMillis() + STARTUP_TIMEOUT.toMillis();
     while (System.currentTimeMillis() < deadline) {
       if (!process.isAlive()) {
-        throw new IllegalStateException("browser exited before DevTools became available");
+        throw new IllegalStateException("browser exited before DevTools became available"
+            + browserOutputSuffix(process));
       }
       try {
         if (!CdpClient.targets(endpoint).isEmpty()) {
           return new BrowserSession(BrowserEngine.SYSTEM, endpoint, port, headless, keepOpen,
-              () -> close(process, profile, keepOpen));
+              () -> close(process, profile, keepOpen, userDataDir == null));
         }
       } catch (IOException ignored) {
         // Browser is still starting.
@@ -60,7 +106,9 @@ final class BrowserLauncher {
       Thread.sleep(300);
     }
     process.destroyForcibly();
-    deleteRecursive(profile);
+    if (userDataDir == null) {
+      deleteRecursive(profile);
+    }
     throw new IllegalStateException("timed out waiting for browser DevTools on port " + port);
   }
 
@@ -130,6 +178,31 @@ final class BrowserLauncher {
     }
   }
 
+  private static String chromiumProxyArg(String server, String username, String password) {
+    String rawServer = server == null ? "" : server.trim();
+    if (rawServer.isEmpty()) {
+      return "";
+    }
+    String lower = rawServer.toLowerCase(Locale.ROOT);
+    boolean isSocks = lower.startsWith("socks5://") || lower.startsWith("socks5h://");
+    if (isSocks && !rawServer.contains("@") && ((username != null && !username.isBlank())
+        || (password != null && !password.isBlank()))) {
+      int schemeSplit = rawServer.indexOf("://");
+      if (schemeSplit > 0) {
+        String scheme = rawServer.substring(0, schemeSplit);
+        String host = rawServer.substring(schemeSplit + 3);
+        String encUser = urlEncode(username == null ? "" : username.trim());
+        String encPass = urlEncode(password == null ? "" : password.trim());
+        return scheme + "://" + encUser + ":" + encPass + "@" + host;
+      }
+    }
+    return rawServer;
+  }
+
+  private static String urlEncode(String value) {
+    return URLEncoder.encode(value, StandardCharsets.UTF_8);
+  }
+
   private static String shellQuote(String value) {
     return "'" + value.replace("'", "'\\''") + "'";
   }
@@ -161,7 +234,7 @@ final class BrowserLauncher {
     }
   }
 
-  private static void close(Process process, Path profile, boolean keepOpen) {
+  private static void close(Process process, Path profile, boolean keepOpen, boolean cleanupProfile) {
     if (keepOpen) {
       return;
     }
@@ -176,6 +249,43 @@ final class BrowserLauncher {
         process.destroyForcibly();
       }
     }
-    deleteRecursive(profile);
+    if (cleanupProfile) {
+      deleteRecursive(profile);
+    }
+  }
+
+  private static void cleanupStaleProfileLocks(Path profile) {
+    for (String name : new String[] {
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+        "DevToolsActivePort",
+    }) {
+      try {
+        Files.deleteIfExists(profile.resolve(name));
+      } catch (IOException ignored) {
+        // Best-effort cleanup for stale Chromium profile locks.
+      }
+    }
+  }
+
+  private static String browserOutputSuffix(Process process) {
+    try {
+      InputStream stream = process.getInputStream();
+      byte[] data = stream.readAllBytes();
+      if (data.length == 0) {
+        return "";
+      }
+      String text = new String(data, StandardCharsets.UTF_8).replaceAll("\\s+", " ").trim();
+      if (text.isEmpty()) {
+        return "";
+      }
+      if (text.length() > 600) {
+        text = text.substring(text.length() - 600);
+      }
+      return ": " + text;
+    } catch (Exception ignored) {
+      return "";
+    }
   }
 }
