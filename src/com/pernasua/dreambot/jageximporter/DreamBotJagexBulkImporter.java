@@ -333,7 +333,7 @@ public final class DreamBotJagexBulkImporter {
         "  --start N                 First 1-based source row to import (default: 1)",
         "  --end N                   Last 1-based source row to import (default: last row)",
         "  --ledger PATH             Non-secret JSONL result ledger",
-        "  --browser-engine NAME     Browser engine for imports: system (default) or jcef",
+        "  --browser-engine NAME     Browser engine for imports: jcef (default) or system",
         "  --browser PATH            System browser executable path",
         "  --user-data-dir PATH      System browser profile directory",
         "  --system-browser          Use Chrome/Chromium/Edge",
@@ -384,7 +384,7 @@ public final class DreamBotJagexBulkImporter {
     if (options.containsKey("system-browser")) {
       return "system";
     }
-    return options.getOrDefault("browser-engine", "system");
+    return options.getOrDefault("browser-engine", "jcef");
   }
 
   private static final class Importer {
@@ -891,7 +891,7 @@ public final class DreamBotJagexBulkImporter {
     boolean stdin;
     int start = 1;
     int end = -1;
-    String browserEngine = "system";
+    String browserEngine = "jcef";
     String browserPath = "";
     Path userDataDir;
     Path jcefDir;
@@ -1104,7 +1104,7 @@ public final class DreamBotJagexBulkImporter {
     private final JTextField db = new JTextField();
     private final JTextField proxyFile = new JTextField();
     private final JButton viewDb = new JButton("View DB");
-    private final JCheckBox headless = new JCheckBox("Headless browser", false);
+    private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
