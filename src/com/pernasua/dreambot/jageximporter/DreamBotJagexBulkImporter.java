@@ -162,7 +162,8 @@ public final class DreamBotJagexBulkImporter {
     }
     if ("--enroll-only".equals(argv.get(0))) {
       Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
-          "input", "account", "jcef-dir",
+          "input", "account", "browser-engine", "browser", "user-data-dir", "system-browser", "embedded-browser",
+          "jcef-dir",
           "devtools-port", "human-check-wait-ms", "headless", "headed", "ledger",
           "mail-code-helper", "proxy-file"));
       List<String> rows = new ArrayList<>();
@@ -180,11 +181,14 @@ public final class DreamBotJagexBulkImporter {
       if (rows.isEmpty()) {
         throw new IllegalArgumentException("--enroll-only requires --input PATH or --account email:password");
       }
+      String browserEngine = browserEngineFromOptions(options);
+      String browserPath = options.getOrDefault("browser", "");
+      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
       long humanWait = options.containsKey("human-check-wait-ms")
           ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
-      boolean headless = browserHeadless(options, true);
+      boolean headless = browserHeadless(options, !"system".equalsIgnoreCase(browserEngine));
       Path ledger = options.containsKey("ledger") ? Paths.get(options.get("ledger")) : null;
       Path bandwidthOut = ledger == null ? null : defaultBandwidth(ledger);
       ProxyConfig proxy = firstProxy(proxyListFromOptions(options));
@@ -203,7 +207,8 @@ public final class DreamBotJagexBulkImporter {
             System.err.println("skip malformed row " + displayIndex);
             continue;
           }
-          try (BrowserSession browser = launchBrowser("jcef", "", jcefDir, port, false, headless, null, proxy,
+          try (BrowserSession browser = launchBrowser(browserEngine, browserPath, jcefDir, port, false, headless,
+              userDataDir, proxy,
               message -> System.err.println(sanitizeDiagnostic("row " + displayIndex + " " + message)))) {
             JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
                 message -> System.err.println(sanitizeDiagnostic("row " + displayIndex + " " + message)));
@@ -241,7 +246,8 @@ public final class DreamBotJagexBulkImporter {
     }
     if ("--disable-email-only".equals(argv.get(0))) {
       Map<String, String> options = parseOptions(argv.subList(1, argv.size()), Set.of(
-          "account", "jcef-dir",
+          "account", "browser-engine", "browser", "user-data-dir", "system-browser", "embedded-browser",
+          "jcef-dir",
           "devtools-port", "human-check-wait-ms", "headless", "headed", "mail-code-helper",
           "proxy-file"));
       String account = options.get("account");
@@ -255,15 +261,19 @@ public final class DreamBotJagexBulkImporter {
       if (email.isEmpty() || password.isEmpty() || secret.isEmpty()) {
         throw new IllegalArgumentException("--account must be email:password:secret");
       }
+      String browserEngine = browserEngineFromOptions(options);
+      String browserPath = options.getOrDefault("browser", "");
+      Path userDataDir = options.containsKey("user-data-dir") ? Paths.get(options.get("user-data-dir")) : null;
       Path jcefDir = options.containsKey("jcef-dir") ? Paths.get(options.get("jcef-dir")) : null;
       int port = options.containsKey("devtools-port") ? Integer.parseInt(options.get("devtools-port")) : 0;
       long humanWait = options.containsKey("human-check-wait-ms")
           ? Long.parseLong(options.get("human-check-wait-ms")) : 300_000L;
-      boolean headless = browserHeadless(options, true);
+      boolean headless = browserHeadless(options, !"system".equalsIgnoreCase(browserEngine));
       String mailCodeHelper = options.getOrDefault("mail-code-helper",
           "/root/projects/dreambot/tools/2b2m_mail_code.py");
       ProxyConfig proxy = firstProxy(proxyListFromOptions(options));
-      try (BrowserSession browser = launchBrowser("jcef", "", jcefDir, port, false, headless, null, proxy,
+      try (BrowserSession browser = launchBrowser(browserEngine, browserPath, jcefDir, port, false, headless,
+          userDataDir, proxy,
           message -> System.err.println(sanitizeDiagnostic("disable-email " + message)))) {
         JagexCdpAutomation automation = new JagexCdpAutomation(browser, humanWait,
             message -> System.err.println(sanitizeDiagnostic("disable-email " + message)));
@@ -323,14 +333,14 @@ public final class DreamBotJagexBulkImporter {
         "  --start N                 First 1-based source row to import (default: 1)",
         "  --end N                   Last 1-based source row to import (default: last row)",
         "  --ledger PATH             Non-secret JSONL result ledger",
-        "  --browser-engine NAME     Compatibility alias accepted for system or embedded browser callers",
-        "  --browser PATH            Compatibility alias accepted for callers that pass a browser binary",
-        "  --user-data-dir PATH      Compatibility alias accepted for callers that reuse a browser profile",
-        "  --system-browser          Compatibility alias for --browser-engine system",
-        "  --embedded-browser        Compatibility alias for --browser-engine jcef",
+        "  --browser-engine NAME     Browser engine for imports: system (default) or jcef",
+        "  --browser PATH            System browser executable path",
+        "  --user-data-dir PATH      System browser profile directory",
+        "  --system-browser          Use Chrome/Chromium/Edge",
+        "  --embedded-browser        Use embedded JCEF",
         "  --jcef-dir PATH           Embedded JCEF native-runtime cache directory",
-        "  --headless                Start embedded JCEF minimized/internal",
-        "  --headed                  Show the embedded JCEF browser window",
+        "  --headless                Run the browser headless/minimized",
+        "  --headed                  Show the browser window",
         "  --devtools-port N         Browser DevTools port (default: auto)",
         "  --human-check-wait-ms N   Max wait for browser challenge pages (default: 300000)",
         "  --rate-limit-cooldown-minutes N  Wait before retrying after Jagex rate limits (default: 180)",
@@ -365,6 +375,16 @@ public final class DreamBotJagexBulkImporter {
       return BrowserLauncher.launch(browserPath, devtoolsPort, keepBrowserOpen, headless, userDataDir, proxy);
     }
     return JcefBrowserLauncher.launch(jcefDir, devtoolsPort, keepBrowserOpen, headless, log, proxy);
+  }
+
+  private static String browserEngineFromOptions(Map<String, String> options) {
+    if (options.containsKey("embedded-browser")) {
+      return "jcef";
+    }
+    if (options.containsKey("system-browser")) {
+      return "system";
+    }
+    return options.getOrDefault("browser-engine", "system");
   }
 
   private static final class Importer {
@@ -450,15 +470,13 @@ public final class DreamBotJagexBulkImporter {
           } catch (CancellationException exception) {
             throw exception;
           } catch (JagexCdpAutomation.TerminalAuthException exception) {
-            String detail = sanitizeDiagnostic(account,
-                exception.getMessage() == null ? exception.toString() : exception.getMessage());
+            String detail = failureDetail(account, exception);
             log.accept("row " + account.index + " skipped: " + detail);
             record(account, exception.status(), detail, 0, null);
             progress.row(completedBefore + 1, total, "Row " + account.index + " " + exception.status());
           } catch (Exception exception) {
             failures++;
-            String detail = sanitizeDiagnostic(account,
-                exception.getMessage() == null ? exception.toString() : exception.getMessage());
+            String detail = failureDetail(account, exception);
             String exceptionType = exception.getClass().getName();
             java.io.StringWriter stackBuffer = new java.io.StringWriter();
             exception.printStackTrace(new java.io.PrintWriter(stackBuffer));
@@ -468,6 +486,9 @@ public final class DreamBotJagexBulkImporter {
                 + truncate(sanitizeDiagnostic(account, stackBuffer.toString()), 4000));
             record(account, "failed", detail, 0, null);
             progress.row(completedBefore + 1, total, "Row " + account.index + " failed");
+            if (isBrowserInfrastructureFailure(exception)) {
+              throw new IllegalStateException("browser infrastructure failure: " + detail, exception);
+            }
           }
         }
         verifyFinalDbCount();
@@ -696,6 +717,58 @@ public final class DreamBotJagexBulkImporter {
       return hours + "h " + minutes + "m";
     }
 
+    private String failureDetail(AccountRow account, Throwable exception) {
+      String message = exception == null
+          ? "unknown failure"
+          : (exception.getMessage() == null ? exception.toString() : exception.getMessage());
+      if (looksLikeGenericJcefInitFailure(exception)) {
+        String cause = rootCauseSummary(exception.getCause());
+        if (!cause.isEmpty()) {
+          message = message + " (" + cause + ")";
+        }
+      }
+      return sanitizeDiagnostic(account, message);
+    }
+
+    private boolean isBrowserInfrastructureFailure(Throwable exception) {
+      if (exception == null) {
+        return false;
+      }
+      String type = exception.getClass().getName();
+      String message = String.valueOf(exception.getMessage() == null ? "" : exception.getMessage())
+          .toLowerCase(Locale.ROOT);
+      return type.contains("CefInitializationException")
+          || message.contains("error while initializing jcef")
+          || message.contains("embedded jcef requires")
+          || message.contains("could not find chrome, chromium, or edge")
+          || message.contains("browser executable does not exist");
+    }
+
+    private boolean looksLikeGenericJcefInitFailure(Throwable exception) {
+      if (exception == null) {
+        return false;
+      }
+      String message = String.valueOf(exception.getMessage() == null ? "" : exception.getMessage())
+          .toLowerCase(Locale.ROOT);
+      return exception.getClass().getName().contains("CefInitializationException")
+          || "error while initializing jcef".equals(message);
+    }
+
+    private String rootCauseSummary(Throwable cause) {
+      Throwable cursor = cause;
+      while (cursor != null && cursor.getCause() != null && cursor.getCause() != cursor) {
+        cursor = cursor.getCause();
+      }
+      if (cursor == null) {
+        return "";
+      }
+      String message = cursor.getMessage();
+      if (message == null || message.isBlank()) {
+        return cursor.getClass().getSimpleName();
+      }
+      return shortReason(message);
+    }
+
     private List<AccountRow> readRowsFromStdin() throws IOException {
       ArrayList<AccountRow> rows = new ArrayList<>();
       try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
@@ -818,7 +891,7 @@ public final class DreamBotJagexBulkImporter {
     boolean stdin;
     int start = 1;
     int end = -1;
-    String browserEngine = "jcef";
+    String browserEngine = "system";
     String browserPath = "";
     Path userDataDir;
     Path jcefDir;
@@ -1031,7 +1104,7 @@ public final class DreamBotJagexBulkImporter {
     private final JTextField db = new JTextField();
     private final JTextField proxyFile = new JTextField();
     private final JButton viewDb = new JButton("View DB");
-    private final JCheckBox headless = new JCheckBox("Minimized/internal browser", true);
+    private final JCheckBox headless = new JCheckBox("Headless browser", false);
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Idle");
     private final JTextArea log = new JTextArea(16, 82);
@@ -1358,19 +1431,23 @@ public final class DreamBotJagexBulkImporter {
       log.accept("DreamBot process guard bypassed; only use this for isolated DB copies");
       return;
     }
-    int matches = 0;
     long currentPid = ProcessHandle.current().pid();
+    List<String> matches = new ArrayList<>();
     for (ProcessHandle process : ProcessHandle.allProcesses().toArray(ProcessHandle[]::new)) {
       if (process.pid() == currentPid) {
         continue;
       }
       if (looksLikeDreamBotProcess(process.info())) {
-        matches++;
+        matches.add(describeProcess(process));
       }
     }
-    if (matches > 0) {
+    if (!matches.isEmpty()) {
+      String detail = matches.size() > 4
+          ? String.join(" | ", matches.subList(0, 4)) + " | ..."
+          : String.join(" | ", matches);
       throw new IllegalStateException("DreamBot appears to be running. Close DreamBot before writing accounts.db, "
-          + "then rerun the importer. Use --allow-dreambot-running only for an isolated DB copy.");
+          + "then rerun the importer. Use --allow-dreambot-running only for an isolated DB copy. Matches: "
+          + sanitizeDiagnostic(detail));
     }
   }
 
@@ -1527,6 +1604,23 @@ public final class DreamBotJagexBulkImporter {
         || lower.contains("dreambotlauncher")
         || "dreambot".equals(commandBase)
         || "dreambot.exe".equals(commandBase);
+  }
+
+  private static String describeProcess(ProcessHandle process) {
+    ProcessHandle.Info info = process.info();
+    String command = sanitizeDiagnostic(info.command().orElse(""));
+    StringBuilder out = new StringBuilder();
+    out.append("pid=").append(process.pid());
+    if (!command.isBlank()) {
+      out.append(" cmd=").append(command);
+    }
+    info.arguments().ifPresent(arguments -> {
+      String joined = sanitizeDiagnostic(String.join(" ", arguments));
+      if (!joined.isBlank()) {
+        out.append(" args=").append(joined);
+      }
+    });
+    return out.toString();
   }
 
   private static void warnIfDbPathLooksUnexpected(Path db, Consumer<String> log) {
