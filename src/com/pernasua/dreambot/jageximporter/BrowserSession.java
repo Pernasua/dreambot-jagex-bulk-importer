@@ -4,11 +4,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 final class BrowserSession implements AutoCloseable {
-  final String engine;
   final String endpoint;
   final int port;
   final boolean headless;
-  final boolean keepOpen;
 
   private final AutoCloseable closeAction;
   private final Runnable revealAction;
@@ -18,15 +16,13 @@ final class BrowserSession implements AutoCloseable {
   private final NativeClickAction nativeClickAction;
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
-  BrowserSession(String engine, String endpoint, int port, boolean headless, boolean keepOpen,
+  BrowserSession(String endpoint, int port, boolean headless,
       AutoCloseable closeAction, Runnable revealAction, Runnable hideAction,
       Consumer<JagexOAuthClient.AuthRequest> authRequestAction, Consumer<String> navigateAction,
       NativeClickAction nativeClickAction) {
-    this.engine = String.valueOf(engine == null ? "" : engine).trim().toLowerCase(java.util.Locale.ROOT);
     this.endpoint = endpoint;
     this.port = port;
     this.headless = headless;
-    this.keepOpen = keepOpen;
     this.closeAction = closeAction == null ? () -> { } : closeAction;
     this.revealAction = revealAction == null ? () -> { } : revealAction;
     this.hideAction = hideAction == null ? () -> { } : hideAction;

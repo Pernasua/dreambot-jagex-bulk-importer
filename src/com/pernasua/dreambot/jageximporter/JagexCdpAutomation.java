@@ -1,5 +1,6 @@
 package com.pernasua.dreambot.jageximporter;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -38,7 +39,7 @@ final class JagexCdpAutomation {
       RunControl control) {
     this.browser = browser;
     this.humanCheckWaitMs = Math.max(0, humanCheckWaitMs);
-    this.log = DiagnosticSanitizer.consumer(log);
+    this.log = log == null ? message -> { } : log;
     this.control = control == null ? RunControl.NONE : control;
   }
 
@@ -63,21 +64,14 @@ final class JagexCdpAutomation {
       String password, String otpSecret) throws Exception {
     control.checkpoint();
     browser.prepareAuthRequest(request);
-    boolean nativeNavigation = "jcef".equals(browser.engine);
-    if (nativeNavigation) {
-      browser.navigate(request.url);
-      sleep(6_000);
-    }
+    browser.navigate(request.url);
+    sleep(6_000);
     CdpClient cdp = openPage();
     try {
       if (!request.referrer.isEmpty()) {
         LinkedHashMap<String, String> headers = new LinkedHashMap<>();
         headers.put("Referer", request.referrer);
         cdp.setExtraHttpHeaders(headers);
-      }
-      if (!nativeNavigation) {
-        navigateForOAuth(cdp, request.url,
-            request.url.contains("flow=launcher") ? "launcher OAuth entry" : "consent OAuth entry");
       }
       sleep(800);
       long totalWaitMs = Math.max(420_000L, humanCheckWaitMs + 180_000L);
@@ -142,16 +136,15 @@ final class JagexCdpAutomation {
         String text = state.text.toLowerCase(Locale.ROOT);
         if (++importLoop % 8 == 1) {
           log.accept("oauth [" + (lastAction.isEmpty() ? "navigating" : lastAction) + "] @ "
-              + brief(state.href) + " :: " + brief(state.text));
+              + stateSummary(state));
         }
         if (state.href.startsWith("chrome-error://")
             || matches(text, "err_blocked_by_client|this page has been blocked by (chrome|chromium)"
                 + "|site can.t be reached|err_[a-z_]+")) {
-          throw new TemporaryOAuthException("browser error page during Jagex OAuth: "
-              + brief(state.href + " " + state.text));
+          throw new TemporaryOAuthException("browser error page during Jagex OAuth at " + safeUrl(state.href));
         }
         if (state.href.contains("error=") || matches(text, "invalid_request|oauth.*error|redirect_uri")) {
-          throw new IllegalStateException("Jagex OAuth error page: " + brief(state.text));
+          throw new IllegalStateException("Jagex OAuth error page at " + safeUrl(state.href));
         }
         String cookieClick = dismissCookieNotice(cdp, text);
         if (!cookieClick.isEmpty()) {
@@ -161,10 +154,10 @@ final class JagexCdpAutomation {
           continue;
         }
         if (matches(text, "technical difficulties|try again later|temporarily unavailable|service unavailable")) {
-          throw new TemporaryOAuthException("Jagex temporary OAuth page: " + brief(state.text));
+          throw new TemporaryOAuthException("Jagex temporary OAuth page at " + safeUrl(state.href));
         }
         if (isRateLimited(text)) {
-          throw new RateLimitedException("Jagex rate limited login: " + brief(state.text));
+          throw new RateLimitedException("Jagex rate limited login at " + safeUrl(state.href));
         }
         if (isAccountLocked(text)) {
           throw new TerminalAuthException("account_locked", "Jagex reported the account is locked");
@@ -493,7 +486,7 @@ final class JagexCdpAutomation {
 
         if (oauthSpinnerStalled(state, text, lastAction, lastActionAt, sameStateSince, now)) {
           throw new TemporaryOAuthException("Jagex OAuth spinner/page stall after " + lastAction
-              + " @ " + brief(state.href + " " + state.text));
+              + " @ " + stateSummary(state));
         }
 
         if (lastAction.isEmpty() && state.actions.isEmpty() && state.text.isEmpty()) {
@@ -557,7 +550,7 @@ final class JagexCdpAutomation {
         }
         String text = state.text.toLowerCase(Locale.ROOT);
         if (++loopCount % 8 == 1) {
-          log.accept("enroll [" + lastAction + "] @ " + brief(state.href) + " :: " + brief(state.text));
+          log.accept("enroll [" + lastAction + "] @ " + stateSummary(state));
         }
 
         if (humanChallengePresent(cdp, state)) {
@@ -573,19 +566,19 @@ final class JagexCdpAutomation {
           continue;
         }
         if (matches(text, "too many requests|tried to do that too many times|rate limit")) {
-          throw new IllegalStateException("Jagex rate limited authenticator enrollment: " + brief(state.text));
+          throw new IllegalStateException("Jagex rate limited authenticator enrollment at " + safeUrl(state.href));
         }
         if (matches(text, "technical difficulties|try again later|temporarily unavailable|service unavailable"
             + "|something went wrong")) {
           throw new IllegalStateException("Jagex temporary page during authenticator enrollment: "
-              + brief(state.text));
+              + stateSummary(state));
         }
         if (isAccountLocked(text)) {
           throw new IllegalStateException("Jagex reported the account is locked");
         }
         if (isInvalidCredentials(text)) {
           throw new IllegalStateException("Jagex login failed during enrollment (invalid credentials): "
-              + brief(state.text));
+              + stateSummary(state));
         }
 
         if (hasInput(state, "email") && !emailFilled) {
@@ -686,11 +679,11 @@ final class JagexCdpAutomation {
           if (onSetupPage) {
             if (!state.href.equals(lastDumpHref)) {
               lastDumpHref = state.href;
-              log.accept("authenticator setup page detected @ " + brief(state.href));
+              log.accept("authenticator setup page detected @ " + safeUrl(state.href));
             }
             secret = extractSecretFromText(enrollText);
             if (!secret.isEmpty()) {
-              log.accept("extracted authenticator secret (len " + secret.length() + ") @ " + brief(state.href));
+              log.accept("extracted authenticator secret (len " + secret.length() + ") @ " + safeUrl(state.href));
               sleep(400);
               continue;
             }
@@ -984,7 +977,7 @@ final class JagexCdpAutomation {
         State state = readState(cdp);
         String text = state.text.toLowerCase(Locale.ROOT);
         if (++loop % 6 == 1) {
-          log.accept("login @ " + brief(state.href) + " :: " + brief(state.text));
+          log.accept("login @ " + stateSummary(state));
         }
         if (matches(text, "two-step authentication|security codes via authenticator|language preference")
             && !matches(text, "enter (?:the )?(?:verification|security) code")
@@ -1011,7 +1004,7 @@ final class JagexCdpAutomation {
           throw new IllegalStateException("Jagex reported the account is locked");
         }
         if (isInvalidCredentials(text)) {
-          throw new IllegalStateException("Jagex login failed (invalid credentials): " + brief(state.text));
+          throw new IllegalStateException("Jagex login failed with invalid credentials at " + safeUrl(state.href));
         }
         if (hasInput(state, "email") && !emailFilled) {
           fillFirst(cdp, Arrays.asList("input[type='email']", "input[name='email']",
@@ -1119,7 +1112,7 @@ final class JagexCdpAutomation {
         String text = state.text.toLowerCase(Locale.ROOT);
         String all = (text + " " + deepInnerText(cdp)).toLowerCase(Locale.ROOT);
         if (++loop % 6 == 1) {
-          log.accept("disable-email [" + lastAction + "] @ " + brief(state.href) + " :: " + brief(state.text));
+          log.accept("disable-email [" + lastAction + "] @ " + stateSummary(state));
         }
         if (humanChallengePresent(cdp, state)) {
           browser.reveal();
@@ -1217,14 +1210,10 @@ final class JagexCdpAutomation {
 
   private CdpClient openPage() throws Exception {
     String ws;
-    if ("system".equals(browser.engine)) {
+    try {
+      ws = CdpClient.pageWebSocket(browser.endpoint);
+    } catch (Exception exception) {
       ws = CdpClient.newPage(browser.endpoint, "about:blank");
-    } else {
-      try {
-        ws = CdpClient.pageWebSocket(browser.endpoint);
-      } catch (Exception exception) {
-        ws = CdpClient.newPage(browser.endpoint, "about:blank");
-      }
     }
     CdpClient cdp = CdpClient.connect(ws);
     cdp.send("Runtime.enable");
@@ -1291,19 +1280,15 @@ final class JagexCdpAutomation {
     boolean hasTargetFrame = false;
     try {
       int matchingTargets = 0;
-      String first = "";
       for (CdpClient.Target target : CdpClient.targets(browser.endpoint)) {
         String targetText = (target.type + " " + target.title + " " + target.url).toLowerCase(Locale.ROOT);
         if ("iframe".equalsIgnoreCase(target.type)
             && matches(targetText, "cloudflare|challenge|turnstile|captcha|human|verify")) {
           matchingTargets++;
-          if (first.isEmpty()) {
-            first = brief(target.title + " " + target.url);
-          }
         }
       }
       if (matchingTargets > 0) {
-        targetInfo = " target_iframe_matches=" + matchingTargets + " first_target=" + first;
+        targetInfo = " target_iframe_matches=" + matchingTargets;
         hasTargetFrame = true;
       } else {
         targetInfo = " target_iframe_matches=0";
@@ -1335,8 +1320,6 @@ final class JagexCdpAutomation {
       int matches = Json.number(domChallenge.get("matches")).intValue();
       domInfo = " dom_iframes=" + visible + "/" + total + " dom_matches=" + matches;
       if (matches > 0 || visible > 0) {
-        String first = brief(Json.stringify(domChallenge.get("first")));
-        domInfo += " first_dom_iframe=" + first;
         hasDomFrame = true;
       }
     } catch (RuntimeException exception) {
@@ -1376,7 +1359,7 @@ final class JagexCdpAutomation {
   private String humanProbeDetail(State state, String reason, String targetInfo, String domInfo, String errors) {
     int textChars = state.text == null ? 0 : state.text.length();
     return "reason=" + reason
-        + " href=" + brief(state.href)
+        + " url=" + safeUrl(state.href)
         + " title=" + brief(state.title)
         + " text_chars=" + textChars
         + " inputs=" + state.inputs.size()
@@ -1554,7 +1537,7 @@ final class JagexCdpAutomation {
       sleep((code.remainingSeconds + 2L) * 1000L);
       code = Totp.generate(secret);
     }
-    log.accept("generated TOTP code; value hidden, period " + code.period + "s, "
+    log.accept("generated TOTP code; period " + code.period + "s, "
         + code.remainingSeconds + "s remaining, counter " + code.counter);
     return code;
   }
@@ -1819,11 +1802,11 @@ final class JagexCdpAutomation {
           + "return {href:location.href,title:document.title,ready:document.readyState,"
           + "active:active?String(active.tagName||'').toLowerCase():'',frames};"
           + "})()"));
-      return "state href=" + brief(Json.string(state.get("href")))
+      return "state url=" + safeUrl(Json.string(state.get("href")))
           + " title=" + brief(Json.string(state.get("title")))
           + " ready=" + brief(Json.string(state.get("ready")))
           + " active=" + brief(Json.string(state.get("active")))
-          + " frames=" + brief(Json.stringify(state.get("frames")));
+          + " frames=" + Json.asList(state.get("frames")).size();
     } catch (RuntimeException stateException) {
       return "state unavailable: " + brief(stateException.getMessage());
     }
@@ -2508,7 +2491,7 @@ final class JagexCdpAutomation {
   }
 
   private String stateFingerprint(State state) {
-    return brief(state.href) + "|" + brief(state.text) + "|i=" + state.inputs.size()
+    return safeUrl(state.href) + "|text_chars=" + String.valueOf(state.text == null ? 0 : state.text.length()) + "|i=" + state.inputs.size()
         + "|a=" + state.actions.size() + "|l=" + state.links.size();
   }
 
@@ -2565,6 +2548,31 @@ final class JagexCdpAutomation {
   private String brief(String text) {
     String clean = String.valueOf(text == null ? "" : text).replaceAll("\\s+", " ").trim();
     return clean.length() <= 240 ? clean : clean.substring(0, 240);
+  }
+
+  private String stateSummary(State state) {
+    int textChars = state.text == null ? 0 : state.text.length();
+    return "url=" + safeUrl(state.href)
+        + " title=" + brief(state.title)
+        + " text_chars=" + textChars
+        + " inputs=" + state.inputs.size()
+        + " actions=" + state.actions.size()
+        + " links=" + state.links.size();
+  }
+
+  private String safeUrl(String value) {
+    try {
+      URI uri = URI.create(String.valueOf(value == null ? "" : value));
+      String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+      String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT);
+      String path = uri.getRawPath();
+      if (host.isEmpty()) {
+        return scheme.isEmpty() ? "/" : scheme + ":";
+      }
+      return scheme + "://" + host + ((path == null || path.isEmpty()) ? "/" : path);
+    } catch (RuntimeException exception) {
+      return "/";
+    }
   }
 
   private void sleep(long millis) {

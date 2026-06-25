@@ -44,9 +44,9 @@ final class JcefBrowserLauncher {
   private JcefBrowserLauncher() {
   }
 
-  static BrowserSession launch(Path installDir, int requestedPort, boolean keepOpen, boolean headless,
+  static BrowserSession launch(Path installDir, int requestedPort, boolean headless,
       Consumer<String> log, ProxyConfig proxy) throws Exception {
-    Consumer<String> safeLog = DiagnosticSanitizer.consumer(log);
+    Consumer<String> safeLog = log == null ? message -> { } : log;
     requireDisplayIfLinux();
     ProxyConfig effectiveProxy = proxy == null ? ProxyConfig.fromEnv() : proxy;
     int port = ensureApp(installDir, requestedPort, safeLog, effectiveProxy);
@@ -58,8 +58,8 @@ final class JcefBrowserLauncher {
 
     String endpoint = "http://127.0.0.1:" + port;
     waitForDevTools(endpoint);
-    return new BrowserSession("jcef", endpoint, port, headless, keepOpen,
-        () -> closeBrowser(browser, client, frame, keepOpen),
+    return new BrowserSession(endpoint, port, headless,
+        () -> closeBrowser(browser, client, frame),
         () -> revealBrowser(frame),
         () -> hideBrowser(frame),
         referrers::register,
@@ -88,7 +88,8 @@ final class JcefBrowserLauncher {
       String proxySignature = proxy == null ? "" : proxy.signature();
       if (app != null) {
         if (!Objects.equals(proxySignature, activeProxySignature)) {
-          disposeApp();
+          throw new IllegalStateException("embedded JCEF is already initialized with different proxy settings; "
+              + "restart the importer to use another proxy");
         }
       }
       if (app != null) {
@@ -102,6 +103,33 @@ final class JcefBrowserLauncher {
       }
 
       Files.createDirectories(installDir);
+      log.accept("starting embedded JCEF on DevTools port " + port);
+      app = buildApp(installDir, port, proxy, log);
+      activeInstallDir = installDir;
+      activePort = port;
+      activeProxySignature = proxySignature;
+      return activePort;
+    }
+  }
+
+  private static CefApp buildApp(Path installDir, int port, ProxyConfig proxy, Consumer<String> log) throws Exception {
+    try {
+      return createAppBuilder(installDir, port, proxy, log).build();
+    } catch (Exception firstFailure) {
+      log.accept("embedded JCEF initialization failed; deleting runtime cache and retrying once");
+      deleteTree(installDir);
+      Files.createDirectories(installDir);
+      try {
+        return createAppBuilder(installDir, port, proxy, log).build();
+      } catch (Exception secondFailure) {
+        secondFailure.addSuppressed(firstFailure);
+        throw secondFailure;
+      }
+    }
+  }
+
+  private static CefAppBuilder createAppBuilder(Path installDir, int port, ProxyConfig proxy,
+      Consumer<String> log) {
       CefAppBuilder builder = new CefAppBuilder();
       builder.setInstallDir(installDir.toFile());
       builder.setProgressHandler(new ProgressLogger(log));
@@ -129,13 +157,21 @@ final class JcefBrowserLauncher {
       settings.log_file = defaultRoot().resolve("jcef.log").toString();
       settings.log_severity = CefSettings.LogSeverity.LOGSEVERITY_DISABLE;
 
-      log.accept("starting embedded JCEF on DevTools port " + port);
-      app = builder.build();
-      activeInstallDir = installDir;
-      activePort = port;
-      activeProxySignature = proxySignature;
-      return activePort;
+      return builder;
+  }
+
+  private static void deleteTree(Path path) throws IOException {
+    if (!Files.exists(path)) {
+      return;
     }
+    if (Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+      try (java.nio.file.DirectoryStream<Path> children = Files.newDirectoryStream(path)) {
+        for (Path child : children) {
+          deleteTree(child);
+        }
+      }
+    }
+    Files.deleteIfExists(path);
   }
 
   private static JFrame showBrowserWindow(CefBrowser browser, boolean visibleOnScreen) throws Exception {
@@ -176,10 +212,7 @@ final class JcefBrowserLauncher {
     throw new IllegalStateException("timed out waiting for embedded JCEF DevTools at " + endpoint);
   }
 
-  private static void closeBrowser(CefBrowser browser, CefClient client, JFrame frame, boolean keepOpen) throws Exception {
-    if (keepOpen) {
-      return;
-    }
+  private static void closeBrowser(CefBrowser browser, CefClient client, JFrame frame) throws Exception {
     try {
       browser.close(true);
     } finally {
@@ -187,25 +220,6 @@ final class JcefBrowserLauncher {
       if (frame != null) {
         SwingUtilities.invokeAndWait(frame::dispose);
       }
-      synchronized (INIT_LOCK) {
-        disposeApp();
-      }
-    }
-  }
-
-  private static void disposeApp() {
-    if (app == null) {
-      return;
-    }
-    try {
-      app.dispose();
-    } catch (Exception ignored) {
-      // Best effort.
-    } finally {
-      app = null;
-      activeInstallDir = null;
-      activePort = 0;
-      activeProxySignature = "";
     }
   }
 
@@ -296,7 +310,7 @@ final class JcefBrowserLauncher {
   }
 
   private static String brief(String value) {
-    String text = DiagnosticSanitizer.sanitize(value == null ? "" : value).replaceAll("\\s+", " ").trim();
+    String text = String.valueOf(value == null ? "" : value).replaceAll("\\s+", " ").trim();
     return text.length() > 220 ? text.substring(0, 220) : text;
   }
 

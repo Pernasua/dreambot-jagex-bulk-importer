@@ -54,7 +54,7 @@ final class JagexOAuthClient {
   }
 
   JagexOAuthClient(java.util.function.Consumer<String> log, ProxyConfig proxy) {
-    this.log = DiagnosticSanitizer.consumer(log);
+    this.log = log == null ? message -> { } : log;
     HttpClient.Builder builder = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(20))
         .followRedirects(HttpClient.Redirect.NEVER);
@@ -395,11 +395,7 @@ final class JagexOAuthClient {
   }
 
   private static String safeHttpError(String body) {
-    String text = DiagnosticSanitizer.sanitize(body == null ? "" : body.replaceAll("\\s+", " ").trim());
-    if (text.length() > 240) {
-      return text.substring(0, 240);
-    }
-    return text;
+    return body == null || body.isBlank() ? "empty response body" : "response body omitted";
   }
 
   private void configureProxy(HttpClient.Builder builder, ProxyConfig proxy) {

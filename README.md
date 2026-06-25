@@ -91,7 +91,6 @@ These flags apply to `--input ...` and `--stdin` import runs.
 | `--human-check-wait-ms N` | Max wait for Jagex/Cloudflare human checks. Default: `300000`. |
 | `--proxy-file PATH` | Proxy list file. One proxy per line as `server|username|password`. |
 | `--rate-limit-cooldown-minutes N` | Wait before retrying after a Jagex rate-limit page. Default: `180`. |
-| `--keep-browser-open` | Leave the browser open after import attempts. |
 | `--allow-dreambot-running` | Bypass the DreamBot process guard for isolated DB copies. |
 | `--dry-run` | Parse rows, validate TOTP secrets, and decrypt DB without importing. |
 | `--mail-code-helper PATH` | Helper command used when login needs an email verification code. |

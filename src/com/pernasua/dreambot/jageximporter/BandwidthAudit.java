@@ -35,7 +35,7 @@ final class BandwidthAudit {
       Record record = ACTIVE_BROWSER.computeIfAbsent(requestId, ignored -> new Record());
       record.requestId = requestId;
       record.method = safe(method, "GET");
-      record.url = DiagnosticSanitizer.sanitizeUrl(safe(url, ""));
+      record.url = safeUrl(url);
       record.host = host(url);
       record.type = safe(resourceType, "other").toLowerCase(Locale.ROOT);
       record.source = "browser";
@@ -74,8 +74,8 @@ final class BandwidthAudit {
     record.source = "api";
     record.type = safe(type, "http").toLowerCase(Locale.ROOT);
     record.method = safe(request.method(), "GET");
-    record.url = DiagnosticSanitizer.sanitizeUrl(request.uri().toString());
-    record.host = host(record.url);
+    record.url = safeUrl(request.uri().toString());
+    record.host = host(request.uri().toString());
     record.status = response.statusCode();
     record.requestHeaderBytes = estimateRequestHeaderBytes(record.method, record.url, flattenHeaders(request.headers().map()));
     long requestBodyBytes = request.bodyPublisher().map(HttpRequest.BodyPublisher::contentLength).orElse(0L);
@@ -165,12 +165,22 @@ final class BandwidthAudit {
     try {
       URI uri = URI.create(safe(url, ""));
       String path = uri.getRawPath();
-      String query = uri.getRawQuery();
-      String out = (path == null || path.isEmpty()) ? "/" : path;
-      if (query != null && !query.isEmpty()) {
-        out += "?" + query;
+      return (path == null || path.isEmpty()) ? "/" : path;
+    } catch (RuntimeException exception) {
+      return "/";
+    }
+  }
+
+  private static String safeUrl(String url) {
+    try {
+      URI uri = URI.create(safe(url, ""));
+      String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+      String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT);
+      String path = uri.getRawPath();
+      if (host.isEmpty()) {
+        return path == null || path.isEmpty() ? "/" : path;
       }
-      return out;
+      return scheme + "://" + host + ((path == null || path.isEmpty()) ? "/" : path);
     } catch (RuntimeException exception) {
       return "/";
     }
